@@ -134,7 +134,7 @@ function getProviderModelConfig(): ProviderModelConfigMap {
   return settings.providerModelConfig ?? {};
 }
 
-function buildAgentArgs(agent: string): string[] {
+function buildAgentArgs(agent: string, prompt?: string): string[] {
   const modelConfig = getProviderModelConfig();
 
   switch (agent) {
@@ -148,6 +148,16 @@ function buildAgentArgs(agent: string): string[] {
     case "opencode": {
       const model = modelConfig.opencode?.model;
       const args = ["opencode", "run", "--format", "json"];
+      if (model) args.push("--model", model);
+      return args;
+    }
+    case "agy": {
+      // agy takes the prompt as the --print flag's own value (not via stdin) --
+      // confirmed by smoke test: bare `--print --output-format ...` makes agy's
+      // parser swallow "--output-format" as the prompt text instead.
+      const model = modelConfig.agy?.model;
+      const args = ["agy", "--dangerously-skip-permissions", `--print=${prompt ?? ""}`,
+                    "--output-format", "stream-json"];
       if (model) args.push("--model", model);
       return args;
     }
@@ -175,7 +185,7 @@ function spawnAgent(
   const promptPath = path.join(logsDir, `${cardId}.prompt.txt`);
   fs.writeFileSync(promptPath, prompt, "utf8");
 
-  const args = buildAgentArgs(agent);
+  const args = buildAgentArgs(agent, prompt);
   const logStream = fs.createWriteStream(logPath, { flags: "w" });
 
   const child = spawn(args[0], args.slice(1), {
@@ -780,10 +790,10 @@ app.post("/api/wake", (req, res) => {
 });
 
 const CardStatus = z.enum(["Inbox", "Planned", "In Progress", "Review/Test", "Done", "Stopped"]);
-const Assignee = z.enum(["claude", "codex", "gemini", "opencode", "copilot", "antigravity"]).optional();
+const Assignee = z.enum(["claude", "codex", "gemini", "opencode", "copilot", "antigravity", "agy"]).optional();
 const Role = z.enum(["devops", "backend", "frontend"]).optional();
 const TaskType = z.enum(["new", "modify", "bugfix"]).optional();
-const Provider = z.enum(["claude", "codex", "gemini", "opencode", "copilot", "antigravity"]);
+const Provider = z.enum(["claude", "codex", "gemini", "opencode", "copilot", "antigravity", "agy"]);
 
 // Default provider settings
 const DEFAULT_PROVIDER_SETTINGS = {
@@ -2017,6 +2027,14 @@ const CLI_TOOLS: CliToolDef[] = [
       return false;
     },
   },
+  {
+    name: "agy",
+    authHint: "Run: agy (complete the interactive Google login once)",
+    checkAuth: () => {
+      // agy (Antigravity CLI) stores its OAuth token here after first interactive login
+      return fileExistsNonEmpty(path.join(os.homedir(), ".gemini", "antigravity-cli", "antigravity-oauth-token"));
+    },
+  },
 ];
 
 function execWithTimeout(cmd: string, args: string[], timeoutMs: number): Promise<string> {
@@ -2481,6 +2499,30 @@ function prettyStreamJson(raw: string): string {
       if (j.type === "turn.completed" && j.usage) {
         const u = j.usage;
         meta.push(`[usage] in=${u.input_tokens} out=${u.output_tokens} cached=${u.cached_input_tokens || 0}`);
+        continue;
+      }
+
+      // agy: init
+      if (j.event === "init" && j.init) {
+        meta.push(`[init] cwd=${j.init.cwd}`);
+        continue;
+      }
+
+      // agy: incremental agent response text (step_update carries one step per line)
+      if (j.event === "step_update" && j.step_update?.step_type === "agent_response" && j.step_update?.text_delta) {
+        chunks.push(j.step_update.text_delta);
+        continue;
+      }
+
+      // agy: other step kinds (user_input/checkpoint/tool calls) are noise here --
+      // final status comes from the "result" event below, so just skip them.
+      if (j.event === "step_update") {
+        continue;
+      }
+
+      // agy: final result -- status only, response text already came from step_update above
+      if (j.event === "result" && j.result) {
+        meta.push(`[result] status=${j.result.status}`);
         continue;
       }
     } catch {

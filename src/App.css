@@ -308,6 +308,35 @@ body {
   border-color: var(--accent-primary);
   box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.2), var(--shadow-md);
 }
+.card.agent-active {
+  animation: agent-active-pulse 1.8s ease-in-out infinite;
+}
+@keyframes agent-active-pulse {
+  0%, 100% {
+    border-color: color-mix(in srgb, var(--accent-primary) 55%, var(--bg-card));
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-primary) 40%, transparent);
+  }
+  50% {
+    border-color: var(--accent-primary);
+    box-shadow: 0 0 0 10px color-mix(in srgb, var(--accent-primary) 70%, transparent);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .card.agent-active {
+    animation: none;
+    border-color: var(--accent-primary);
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-primary) 40%, transparent);
+  }
+}
+.agentActiveDot {
+  display: inline-block;
+  flex-shrink: 0;
+  width: 6px;
+  height: 6px;
+  align-self: center;
+  background: var(--accent-primary);
+  border-radius: 50%;
+}
 .cardTitle {
   font-size: 13px;
   font-weight: 600;

@@ -1,7 +1,7 @@
 export type CardStatus = "Inbox" | "Planned" | "In Progress" | "Review/Test" | "Done" | "Stopped";
-export type Assignee = "claude" | "codex" | "gemini" | "opencode" | "copilot" | "antigravity" | null;
+export type Assignee = "claude" | "codex" | "gemini" | "opencode" | "copilot" | "antigravity" | "agy" | null;
 export type Role = "devops" | "backend" | "frontend";
-export type Provider = "claude" | "codex" | "gemini" | "opencode" | "copilot" | "antigravity";
+export type Provider = "claude" | "codex" | "gemini" | "opencode" | "copilot" | "antigravity" | "agy";
 export type TaskType = "new" | "modify" | "bugfix";
 
 export interface ProviderModelConfig {

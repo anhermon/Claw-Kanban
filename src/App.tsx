@@ -57,6 +57,7 @@ const CLI_PROVIDERS: { value: Provider; label: string; desc: string }[] = [
   { value: "codex", label: "Codex CLI", desc: "OpenAI Codex" },
   { value: "gemini", label: "Gemini CLI", desc: "Google Gemini" },
   { value: "opencode", label: "OpenCode", desc: "OpenCode CLI" },
+  { value: "agy", label: "Agy", desc: "Antigravity CLI" },
 ];
 const OAUTH_ASSIGNABLE: { value: Provider; label: string; desc: string; oauthKey: OAuthConnectProvider }[] = [
   { value: "copilot", label: "GitHub Copilot", desc: "via OAuth", oauthKey: "github-copilot" },
@@ -490,10 +491,13 @@ export default function App() {
             </div>
             <div className="colBody">
               {columns[s].map((c) => (
-                <div key={c.id} className={"card" + (selected?.id === c.id ? " selected" : "")}
+                <div key={c.id} className={"card"
+                       + (selected?.id === c.id ? " selected" : "")
+                       + (c.status === "In Progress" ? " agent-active" : "")}
                      onClick={() => openCard(c)}>
                   <div className="cardTitle">{c.title}</div>
                   <div className="cardMeta">
+                    {c.status === "In Progress" && <span className="agentActiveDot" aria-hidden="true"></span>}
                     <span>{c.assignee ?? "unassigned"}</span>
                     {c.role && <span className="cardRole">{ROLES.find(r => r.value === c.role)?.label}</span>}
                     <span>·</span>
