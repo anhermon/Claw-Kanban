@@ -15,15 +15,18 @@ import type {
   DeviceCodeStart,
   OAuthModelMap,
   ProviderModelConfig,
+  CardSessionResponse,
+  ParsedSession,
+  SessionTimelineEntry,
 } from "./api";
 import {
   createCard,
   deleteCard,
   getLogs,
   getTerminal,
+  getCardSession,
   listCards,
   patchCard,
-  purgeByStatus,
   runCard,
   stopCard,
   reviewCard,
@@ -39,6 +42,12 @@ import {
   startGitHubDeviceFlow,
   pollGitHubDevice,
   getOAuthModels,
+  syncHarness,
+  getQueueStatus,
+  saveQueueConfig,
+  moveActiveToBacklog,
+  dispatchNextTask,
+  type QueueStatusResponse,
 } from "./api";
 
 const STATUSES: CardStatus[] = ["Inbox", "Planned", "In Progress", "Review/Test", "Done", "Stopped"];
@@ -74,6 +83,70 @@ function fmtTime(ms: number) {
   return d.toLocaleString();
 }
 
+function formatMsDuration(ms: number | null | undefined): string {
+  if (ms == null) return "-";
+  const totalSeconds = Math.floor(ms / 1000);
+  const h = Math.floor(totalSeconds / 3600);
+  const m = Math.floor((totalSeconds % 3600) / 60);
+  const s = totalSeconds % 60;
+  if (h > 0) return `${h}h ${m}m ${s}s`;
+  if (m > 0) return `${m}m ${s}s`;
+  if (totalSeconds > 0) return `${s}s`;
+  return `${ms}ms`;
+}
+
+function formatCost(usd: number | null | undefined): string {
+  if (usd == null) return "-";
+  return `$${usd.toFixed(4)}`;
+}
+
+function formatTokenCount(n: number | null | undefined): string {
+  if (n == null) return "-";
+  return n.toLocaleString();
+}
+
+// Compact k/M token formatting for the dense card badge (the full-precision count is available
+// via the existing Agent Session modal's formatTokenCount usage).
+function formatCompactTokenCount(n: number | null | undefined): string {
+  if (n == null) return "-";
+  if (n < 1000) return String(n);
+  if (n < 1_000_000) return `${(n / 1000).toFixed(1).replace(/\.0$/, "")}k`;
+  return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`;
+}
+
+// Card-level per-stage duration summary, derived from the card's persisted+live run stats
+// (inProgressDurationMs/reviewDurationMs/totalDurationMs, populated server-side from ALL of the
+// card's card_runs rows - see attachRunStats() in server/index.ts). Returns null for cards with
+// no run history at all, so callers can render nothing.
+function cardDurationSummary(c: Card): { text: string; title: string } | null {
+  // Treat a card with run history but a zero settled/so-far duration the same as "no history" -
+  // otherwise a card whose only runs never accumulated real time would render "Total: 0ms" /
+  // "In: 0ms (live)", exactly the empty-badge clutter this feature is supposed to avoid for
+  // never-run cards.
+  if (!c.totalDurationMs) return null;
+
+  if (c.status === "In Progress") {
+    return {
+      text: `In: ${formatMsDuration(c.inProgressDurationMs)} (live)`,
+      title: "Time in In Progress so far (persists if the card leaves this stage)",
+    };
+  }
+  if (c.status === "Review/Test") {
+    const parts: string[] = [];
+    if (c.inProgressDurationMs) parts.push(`In: ${formatMsDuration(c.inProgressDurationMs)}`);
+    parts.push(`Review: ${formatMsDuration(c.reviewDurationMs)} (live)`);
+    return { text: parts.join(" · "), title: "Time per stage (In Progress duration is preserved from before)" };
+  }
+
+  // Settled status (Done, Stopped, or moved back to Inbox/Planned) with run history: show the
+  // full breakdown. Per-ticket-ask: "a done ticket should show both durations + total".
+  const parts: string[] = [];
+  if (c.inProgressDurationMs) parts.push(`In: ${formatMsDuration(c.inProgressDurationMs)}`);
+  if (c.reviewDurationMs) parts.push(`Review: ${formatMsDuration(c.reviewDurationMs)}`);
+  parts.push(`Total: ${formatMsDuration(c.totalDurationMs)}`);
+  return { text: parts.join(" · "), title: "Time spent per stage across all runs on this card" };
+}
+
 function groupByStatus(cards: Card[]) {
   const m: Record<CardStatus, Card[]> = {
     "Inbox": [],
@@ -101,6 +174,13 @@ export default function App() {
   const [termPath, setTermPath] = useState<string | null>(null);
   const [termFollow, setTermFollow] = useState(true);
   const termRef = useRef<HTMLPreElement | null>(null);
+  const newTitleRef = useRef<HTMLInputElement | null>(null);
+
+  const [sessionOpen, setSessionOpen] = useState(false);
+  const [sessionData, setSessionData] = useState<CardSessionResponse | null>(null);
+  const [sessionTab, setSessionTab] = useState<"implementation" | "review">("implementation");
+  const [sessionErr, setSessionErr] = useState<string | null>(null);
+  const [expandedToolCalls, setExpandedToolCalls] = useState<Set<string>>(new Set());
 
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settings, setSettings] = useState<ProviderSettings>(DEFAULT_PROVIDER_SETTINGS);
@@ -121,6 +201,10 @@ export default function App() {
   const [devicePolling, setDevicePolling] = useState(false);
   const [deviceStatus, setDeviceStatus] = useState<string | null>(null);
 
+  const [syncingHarness, setSyncingHarness] = useState(false);
+  const [harnessMsg, setHarnessMsg] = useState<string | null>(null);
+  const [queueStatus, setQueueStatus] = useState<QueueStatusResponse | null>(null);
+
   const [oauthModels, setOauthModels] = useState<OAuthModelMap>({});
 
   const [newRole, setNewRole] = useState<Role | "">("");
@@ -130,6 +214,7 @@ export default function App() {
   async function refresh() {
     const cs = await listCards();
     setCards(cs);
+    getQueueStatus().then(setQueueStatus).catch(() => {});
     if (selected) {
       const next = cs.find((c) => c.id === selected.id) ?? null;
       setSelected(next);
@@ -305,7 +390,7 @@ export default function App() {
   useEffect(() => {
     refresh().catch((e) => setErr(String(e)));
     loadSettings().catch(() => {});
-    const t = setInterval(() => refresh().catch(() => {}), 2500);
+    const t = setInterval(() => refresh().catch(() => {}), 1200);
     return () => clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -366,7 +451,39 @@ export default function App() {
     el.scrollTop = el.scrollHeight;
   }, [termText, termOpen, termFollow]);
 
+  useEffect(() => {
+    if (!sessionOpen || !selected) return;
+    let alive = true;
+    const cardId = selected.id;
+    const isLive = selected.status === "In Progress" || selected.status === "Review/Test";
+
+    async function tick() {
+      try {
+        const s = await getCardSession(cardId);
+        if (!alive) return;
+        setSessionData(s);
+        setSessionErr(null);
+      } catch (e) {
+        if (!alive) return;
+        setSessionErr(String((e as Error).message ?? e));
+      }
+    }
+
+    tick();
+    const iv = isLive ? setInterval(tick, 2000) : null;
+    return () => {
+      alive = false;
+      if (iv) clearInterval(iv);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionOpen, selected?.id, selected?.status]);
+
   const columns = useMemo(() => groupByStatus(cards), [cards]);
+  const totalActive = (columns["In Progress"]?.length ?? 0) + (columns["Review/Test"]?.length ?? 0);
+  const wipMax = queueStatus?.maxConcurrentTasks ?? 2;
+  const wipAtLimit = totalActive >= wipMax;
+  const wipPctDeg = Math.max(0, Math.min(1, totalActive / Math.max(1, wipMax))) * 360;
+  const dialRingColor = wipAtLimit ? "var(--warn)" : "var(--accent)";
 
   async function move(card: Card, status: CardStatus) {
     if (card.status === status) return;
@@ -381,17 +498,87 @@ export default function App() {
 
   return (
     <div className="layout">
-      <header className="topbar">
-        <div className="titleGroup">
-          <img src="/kanban-claw.svg" alt="Claw Kanban" className="titleIcon" />
+      <nav className="rail">
+        <div className="railBrand">
+          <img src="/kanban-claw.svg" alt="Claw Kanban" className="railBrandIcon" />
           <div>
-            <div className="title">Claw Kanban</div>
-            <div className="subtitle">AI Agent Orchestration Board - Claude / Codex / Gemini</div>
+            <div className="railBrandName">Claw Kanban</div>
+            <div className="railBrandSub">Agent Orchestration</div>
           </div>
         </div>
-        <div className="right">
+
+        <div className="dialWrap">
+          <div className="dial" style={{ background: `conic-gradient(${dialRingColor} 0deg ${wipPctDeg}deg, rgba(255,255,255,0.08) ${wipPctDeg}deg 360deg)` }}>
+            <div className="dialFace">
+              <span className="dialNum">{totalActive}</span>
+              <span className="dialCap">of {wipMax}</span>
+            </div>
+          </div>
+          <span className="dialLabel">Active tasks (WIP)</span>
+          <select
+            className="dialSelect"
+            value={queueStatus?.maxConcurrentTasks ?? 2}
+            onChange={async (e) => {
+              const limit = Number(e.target.value);
+              await saveQueueConfig({ maxConcurrentTasks: limit });
+              await refresh();
+            }}
+            title="Maximum concurrent tickets to work on"
+          >
+            {[1, 2, 3, 4, 5, 8].map((n) => (
+              <option key={n} value={n}>Max {n}</option>
+            ))}
+          </select>
+        </div>
+
+        <div className="railGroup">
           <button
-            className="btn"
+            className={`railBtn ${queueStatus?.autoDispatch ? "on" : ""}`}
+            onClick={async () => {
+              const next = !queueStatus?.autoDispatch;
+              await saveQueueConfig({ autoDispatch: next });
+              await refresh();
+            }}
+            title="Gradually auto-process tasks from Planned up to WIP limit"
+          >
+            {queueStatus?.autoDispatch ? "⚡ Queue: ON" : "⏸ Queue: OFF"}
+          </button>
+
+          <button
+            className="railBtn"
+            onClick={async () => {
+              const res = await dispatchNextTask();
+              if (res.dispatched) {
+                setHarnessMsg(`Dispatched: ${res.card?.title}`);
+                setTimeout(() => setHarnessMsg(null), 4000);
+              } else {
+                alert(res.reason || "No task dispatched");
+              }
+              await refresh();
+            }}
+            title="Process next task from Planned gradually"
+          >
+            ▶ Next
+          </button>
+
+          <button
+            className="railBtn"
+            onClick={async () => {
+              if (!confirm("Move all In-Progress and Review/Test tickets back to Planned (Backlog)?")) return;
+              const res = await moveActiveToBacklog();
+              await refresh();
+              setHarnessMsg(`Moved ${res.count} tickets back to Planned`);
+              setTimeout(() => setHarnessMsg(null), 5000);
+            }}
+            title="Move all In-Progress and Review/Test tickets back to Planned"
+          >
+            ↩ To Backlog
+          </button>
+        </div>
+
+        <div className="railGroup">
+          <button
+            className="railBtn"
             onClick={() => {
               loadSettings();
               loadCliStatus();
@@ -402,21 +589,49 @@ export default function App() {
             }}
           >Settings</button>
           <button
-            className="btn"
+            className="railBtn"
+            disabled={syncingHarness}
             onClick={async () => {
-              if (!confirm("Purge all Inbox cards?")) return;
-              await purgeByStatus("Inbox");
-              await refresh();
+              setSyncingHarness(true);
+              setHarnessMsg(null);
+              try {
+                const res = await syncHarness();
+                await refresh();
+                setHarnessMsg(`Synced ${res.totalSynced} tasks (${res.epicsCount} Jira Epics, ${res.internalCount} Internal) from Agent Harness`);
+                setTimeout(() => setHarnessMsg(null), 6000);
+              } catch (e) {
+                setErr(String((e as Error).message ?? e));
+              } finally {
+                setSyncingHarness(false);
+              }
             }}
-          >Clear Inbox</button>
-          <button className="btn" onClick={() => refresh()}>Refresh</button>
+          >
+            {syncingHarness ? "Syncing..." : "🔄 Sync Harness"}
+          </button>
+          <button className="railBtn" onClick={() => refresh()}>Refresh</button>
         </div>
-      </header>
 
-      {err ? <div className="error">{err}</div> : null}
+        <div className="railGroupBottom">
+          <button
+            className="railBtn primary"
+            onClick={() => newTitleRef.current?.focus()}
+            title="Jump to the new card form"
+          >+ New Card</button>
+        </div>
+      </nav>
+
+      <div className="main">
+        <div className="mainHead">
+          <h1 className="mainTitle">Claw Kanban</h1>
+          <p className="mainSub">AI Agent Orchestration Board - Claude / Codex / Gemini</p>
+        </div>
+
+        {harnessMsg && <div className="harnessBanner">{harnessMsg}</div>}
+        {err ? <div className="error">{err}</div> : null}
 
       <section className="newcard">
         <input
+          ref={newTitleRef}
           value={newTitle}
           onChange={(e) => setNewTitle(e.target.value)}
           placeholder="New card title (e.g. fix hero card gray border bug)"
@@ -482,27 +697,53 @@ export default function App() {
         >+ Add</button>
       </section>
 
-      <main className="board">
+      <main className={`board ${selected ? "drawerOpen" : ""}`}>
         {STATUSES.map((s) => (
           <div key={s} className="col">
             <div className="colHeader">
               <span>{s}</span>
-              <span className="badge">{columns[s].length}</span>
+              <span className={`badge ${(s === "In Progress" || s === "Review/Test") && totalActive >= (queueStatus?.maxConcurrentTasks ?? 2) ? "badge-limit" : ""}`}>
+                {(s === "In Progress" || s === "Review/Test") ? `${totalActive}/${queueStatus?.maxConcurrentTasks ?? 2} max` : columns[s].length}
+              </span>
             </div>
             <div className="colBody">
               {columns[s].map((c) => (
                 <div key={c.id} className={"card"
                        + (selected?.id === c.id ? " selected" : "")
-                       + (c.status === "In Progress" ? " agent-active" : "")}
+                       + (c.status === "In Progress" ? " agent-active" : "")
+                       + (c.status === "Review/Test" ? " agent-reviewing" : "")}
                      onClick={() => openCard(c)}>
-                  <div className="cardTitle">{c.title}</div>
+                  <div className="cardTitle">
+                    {c.source === "agent-harness:jira" && <span className="cardEpicBadge">EPIC</span>}
+                    {c.source === "agent-harness:internal" && <span className="cardInternalBadge">INTERNAL</span>}
+                    {c.title.replace(/^\[(EPIC|INTERNAL)\]\s*/, "")}
+                  </div>
                   <div className="cardMeta">
                     {c.status === "In Progress" && <span className="agentActiveDot" aria-hidden="true"></span>}
-                    <span>{c.assignee ?? "unassigned"}</span>
+                    {c.status === "Review/Test" && <span className="agentReviewDot" aria-hidden="true"></span>}
+                    <span className="cardModel">{c.assignee ?? "unassigned"}</span>
                     {c.role && <span className="cardRole">{ROLES.find(r => r.value === c.role)?.label}</span>}
+                    {(() => {
+                      const duration = cardDurationSummary(c);
+                      return duration ? (
+                        <span className="cardDuration" title={duration.title}>⏱ {duration.text}</span>
+                      ) : null;
+                    })()}
                     <span>·</span>
                     <span>{fmtTime(c.updated_at)}</span>
                   </div>
+                  {c.modelsUsed && c.modelsUsed.length > 0 && (
+                    <div className="cardRunMeta">
+                      {c.modelsUsed.map((m) => (
+                        <span key={m} className="cardModelPill" title={`Model used: ${m}`}>{m}</span>
+                      ))}
+                      {(c.totalInputTokens != null || c.totalOutputTokens != null) && (
+                        <span className="cardTokenStat" title="Total tokens across completed runs on this card">
+                          {formatCompactTokenCount(c.totalInputTokens)} in / {formatCompactTokenCount(c.totalOutputTokens)} out
+                        </span>
+                      )}
+                    </div>
+                  )}
                   <div className="cardActions" onClick={(e) => e.stopPropagation()}>
                     <select value={c.status} onChange={(e) => move(c, e.target.value as CardStatus)}>
                       {STATUSES.map((st) => (
@@ -516,179 +757,210 @@ export default function App() {
           </div>
         ))}
       </main>
+      </div>
 
       {selected && (
-        <aside className="side">
-          <div className="sideInner">
-            <div className="sideHeader">
-              <div className="sideTitle">{selected.title}</div>
-              <button
-                className="sideClose"
-                onClick={() => {
-                  setSelected(null);
-                  setLogs([]);
-                }}
-                aria-label="Close"
-              >×</button>
+        <section className="drawer">
+          <div className="drawerHead">
+            <div className="drawerTitleBlock">
+              <div className="drawerBadges">
+                {selected.source === "agent-harness:jira" && <span className="cardEpicBadge">EPIC</span>}
+                {selected.source === "agent-harness:internal" && <span className="cardInternalBadge">INTERNAL</span>}
+              </div>
+              <h2 className="drawerTitle">{selected.title.replace(/^\[(EPIC|INTERNAL)\]\s*/, "")}</h2>
             </div>
-            <div className="sideMeta">
+            <button
+              className="drawerClose"
+              onClick={() => {
+                setSelected(null);
+                setLogs([]);
+              }}
+              aria-label="Close"
+            >×</button>
+          </div>
+
+          <div className="drawerBody">
+            <div className="drawerCol drawerMeta">
               <div><b>ID</b> {selected.id}</div>
               <div><b>Source</b> {selected.source} {selected.source_message_id ? `(msg ${selected.source_message_id})` : ""}</div>
               <div><b>Author</b> {selected.source_author ?? "-"}</div>
               <div><b>Chat</b> {selected.source_chat ?? "-"}</div>
               {selected.project_path && <div><b>Working Dir</b> <code>{selected.project_path}</code></div>}
             </div>
-            <div className="sideFieldGroup">
-              <label>Role</label>
-              <select
-                value={selected.role || ""}
-                onChange={async (e) => {
-                  const role = e.target.value as Role | "";
-                  setSelected({ ...selected, role: role || undefined });
-                  await patchCard(selected.id, { role: role || undefined });
-                  await refresh();
-                }}
-              >
-                <option value="">None</option>
-                {ROLES.map((r) => (
-                  <option key={r.value} value={r.value}>{r.label}</option>
-                ))}
-              </select>
-            </div>
-            {selected.role === "frontend" && (
-              <div className="sideFieldGroup">
-                <label>Task Type</label>
+
+            <div className="drawerCol">
+              <div className="drawerFieldGroup">
+                <label>Role</label>
                 <select
-                  value={selected.task_type || ""}
+                  value={selected.role || ""}
                   onChange={async (e) => {
-                    const taskType = e.target.value as TaskType | "";
-                    setSelected({ ...selected, task_type: taskType || undefined });
-                    await patchCard(selected.id, { task_type: taskType || undefined });
+                    const role = e.target.value as Role | "";
+                    setSelected({ ...selected, role: role || undefined });
+                    await patchCard(selected.id, { role: role || undefined });
                     await refresh();
                   }}
                 >
                   <option value="">None</option>
-                  {TASK_TYPES.map((t) => (
-                    <option key={t.value} value={t.value}>{t.label}</option>
+                  {ROLES.map((r) => (
+                    <option key={r.value} value={r.value}>{r.label}</option>
                   ))}
                 </select>
               </div>
-            )}
-            <div className="sideFieldGroup">
-              <label>Provider (Assignee)</label>
-              <select
-                value={selected.assignee || ""}
-                onChange={async (e) => {
-                  const assignee = e.target.value as Provider | "";
-                  setSelected({ ...selected, assignee: assignee || null });
-                  await patchCard(selected.id, { assignee: assignee || undefined });
-                  await refresh();
-                }}
-              >
-                <option value="">Auto-assign</option>
-                {PROVIDERS.map((p) => (
-                  <option key={p.value} value={p.value} disabled={!isProviderAvailable(p.value)}>
-                    {p.label} {!isProviderAvailable(p.value) ? "(not authenticated)" : `(${p.desc})`}
-                  </option>
-                ))}
-              </select>
+              {selected.role === "frontend" && (
+                <div className="drawerFieldGroup">
+                  <label>Task Type</label>
+                  <select
+                    value={selected.task_type || ""}
+                    onChange={async (e) => {
+                      const taskType = e.target.value as TaskType | "";
+                      setSelected({ ...selected, task_type: taskType || undefined });
+                      await patchCard(selected.id, { task_type: taskType || undefined });
+                      await refresh();
+                    }}
+                  >
+                    <option value="">None</option>
+                    {TASK_TYPES.map((t) => (
+                      <option key={t.value} value={t.value}>{t.label}</option>
+                    ))}
+                  </select>
+                </div>
+              )}
+              <div className="drawerFieldGroup">
+                <label>Provider (Assignee)</label>
+                <select
+                  value={selected.assignee || ""}
+                  onChange={async (e) => {
+                    const assignee = e.target.value as Provider | "";
+                    setSelected({ ...selected, assignee: assignee || null });
+                    await patchCard(selected.id, { assignee: assignee || undefined });
+                    await refresh();
+                  }}
+                >
+                  <option value="">Auto-assign</option>
+                  {PROVIDERS.map((p) => (
+                    <option key={p.value} value={p.value} disabled={!isProviderAvailable(p.value)}>
+                      {p.label} {!isProviderAvailable(p.value) ? "(not authenticated)" : `(${p.desc})`}
+                    </option>
+                  ))}
+                </select>
+              </div>
             </div>
-            <div className="sideFieldGroup">
-              <label>Project Path</label>
-              <input
-                value={selected.project_path ?? ""}
-                onChange={(e) => setSelected({ ...selected, project_path: e.target.value || null })}
-                placeholder="e.g. /Users/me/my-project"
-                style={{ fontFamily: "monospace", fontSize: "0.85em" }}
+
+            <div className="drawerCol">
+              <div className="drawerFieldGroup">
+                <label>Project Path</label>
+                <input
+                  value={selected.project_path ?? ""}
+                  onChange={(e) => setSelected({ ...selected, project_path: e.target.value || null })}
+                  placeholder="e.g. /Users/me/my-project"
+                />
+              </div>
+              <textarea
+                className="drawerTextarea"
+                value={selected.description}
+                onChange={(e) => setSelected({ ...selected, description: e.target.value })}
+                rows={6}
               />
-            </div>
-            <textarea
-              value={selected.description}
-              onChange={(e) => setSelected({ ...selected, description: e.target.value })}
-              rows={8}
-            />
-            <div className="sideBtns">
-              <button
-                className="btn"
-                onClick={async () => {
-                  await patchCard(selected.id, {
-                    description: selected.description,
-                    project_path: selected.project_path || null,
-                  });
-                  await refresh();
-                }}
-              >Save Details</button>
-              <button
-                className="btn"
-                onClick={async () => {
-                  setLogs(await getLogs(selected.id));
-                }}
-              >Refresh Logs</button>
-              <button
-                className="btn"
-                onClick={() => setTermOpen(true)}
-              >Terminal</button>
-
-              {(selected.status === "Inbox" || selected.status === "Planned" || selected.status === "Stopped") && (
-                <button
-                  className="btn primary"
-                  onClick={async () => {
-                    if (!confirm("Start this task (run agent)?")) return;
-                    await runCard(selected.id);
-                    await refresh();
-                    setTermOpen(true);
-                  }}
-                >{selected.status === "Stopped" ? "Restart" : "Start"}</button>
-              )}
-
-              {selected.status === "Review/Test" && (
-                <button
-                  className="btn primary"
-                  onClick={async () => {
-                    if (!confirm("Re-run review/test?")) return;
-                    await reviewCard(selected.id);
-                    await refresh();
-                    setTermOpen(true);
-                  }}
-                >Re-review</button>
-              )}
-
-              {selected.status === "In Progress" && (
+              <div className="drawerBtnsInline">
                 <button
                   className="btn"
                   onClick={async () => {
-                    if (!confirm("Stop this task (kill process)?")) return;
-                    await stopCard(selected.id);
+                    await patchCard(selected.id, {
+                      description: selected.description,
+                      project_path: selected.project_path || null,
+                    });
                     await refresh();
                   }}
-                >Stop</button>
-              )}
-
-              <button
-                className="btn danger"
-                onClick={async () => {
-                  if (!confirm("Delete this card?")) return;
-                  await deleteCard(selected.id);
-                  setSelected(null);
-                  setLogs([]);
-                  await refresh();
-                }}
-              >Delete</button>
+                >Save Details</button>
+              </div>
             </div>
 
-            <div className="logs">
+            <div className="drawerCol">
+              <div className="drawerBtns">
+                <button
+                  className="btn"
+                  onClick={async () => {
+                    setLogs(await getLogs(selected.id));
+                  }}
+                >Refresh Logs</button>
+                <button
+                  className="btn"
+                  onClick={() => setTermOpen(true)}
+                >Terminal</button>
+                <button
+                  className="btn"
+                  onClick={() => {
+                    setSessionTab(selected.status === "Review/Test" ? "review" : "implementation");
+                    setSessionData(null);
+                    setSessionErr(null);
+                    setExpandedToolCalls(new Set());
+                    setSessionOpen(true);
+                  }}
+                >🔎 Agent Session</button>
+
+                {(selected.status === "Inbox" || selected.status === "Planned" || selected.status === "Stopped") && (
+                  <button
+                    className="btn primary"
+                    onClick={async () => {
+                      if (!confirm("Start this task (run agent)?")) return;
+                      await runCard(selected.id);
+                      await refresh();
+                      setTermOpen(true);
+                    }}
+                  >{selected.status === "Stopped" ? "Restart" : "Start"}</button>
+                )}
+
+                {selected.status === "Review/Test" && (
+                  <button
+                    className="btn primary"
+                    onClick={async () => {
+                      if (!confirm("Re-run review/test?")) return;
+                      await reviewCard(selected.id);
+                      await refresh();
+                      setTermOpen(true);
+                    }}
+                  >Re-review</button>
+                )}
+
+                {selected.status === "In Progress" && (
+                  <button
+                    className="btn"
+                    onClick={async () => {
+                      if (!confirm("Stop this task (kill process)?")) return;
+                      await stopCard(selected.id);
+                      await refresh();
+                    }}
+                  >Stop</button>
+                )}
+
+                <button
+                  className="btn danger"
+                  onClick={async () => {
+                    if (!confirm("Delete this card?")) return;
+                    await deleteCard(selected.id);
+                    setSelected(null);
+                    setLogs([]);
+                    await refresh();
+                  }}
+                >Delete</button>
+              </div>
+            </div>
+
+            <div className="drawerCol drawerLogsCol">
               <div className="logsHeader">Logs (latest 500)</div>
-              {logs.length === 0 ? <div className="logRow dim">(no logs)</div> : null}
-              {logs.map((l) => (
-                <div key={l.id} className="logRow">
-                  <span className="logTime">{fmtTime(l.created_at)}</span>
-                  <span className="logKind">[{l.kind}]</span>
-                  <span className="logMsg">{l.message}</span>
-                </div>
-              ))}
+              <div className="logs">
+                {logs.length === 0 ? <div className="logRow dim">(no logs)</div> : null}
+                {logs.map((l) => (
+                  <div key={l.id} className="logRow">
+                    <span className="logTime">{fmtTime(l.created_at)}</span>
+                    <span className="logKind">[{l.kind}]</span>
+                    <span className="logMsg">{l.message}</span>
+                  </div>
+                ))}
+              </div>
             </div>
           </div>
-        </aside>
+        </section>
       )}
       {termOpen ? (
         <div className="modalOverlay" onClick={() => setTermOpen(false)}>
@@ -714,6 +986,203 @@ export default function App() {
               </div>
             </div>
             <pre ref={termRef} className="terminal">{termText || "(no terminal log yet)"}</pre>
+          </div>
+        </div>
+      ) : null}
+
+      {sessionOpen ? (
+        <div className="modalOverlay" onClick={() => setSessionOpen(false)}>
+          <div className="modal sessionModal" onClick={(e) => e.stopPropagation()}>
+            <div className="modalHeader">
+              <div>
+                <div className="modalTitle">🔎 Agent Session · {selected?.title ?? ""}</div>
+                <div className="modalSub">
+                  {sessionData?.implementation?.sessionId ?? sessionData?.review?.sessionId ?? ""}
+                </div>
+              </div>
+              <div className="modalActions">
+                <button className="btn" onClick={() => setSessionOpen(false)}>Close</button>
+              </div>
+            </div>
+
+            {(() => {
+              const hasImpl = !!sessionData?.implementation;
+              const hasReview = !!sessionData?.review;
+              const activeSession: ParsedSession | null =
+                sessionTab === "review" ? sessionData?.review ?? null : sessionData?.implementation ?? null;
+
+              return (
+                <>
+                  {(hasImpl || hasReview) && (
+                    <div className="sessionTabs">
+                      {hasImpl && (
+                        <button
+                          className={`sessionTab ${sessionTab === "implementation" ? "active" : ""}`}
+                          onClick={() => setSessionTab("implementation")}
+                        >Implementation</button>
+                      )}
+                      {hasReview && (
+                        <button
+                          className={`sessionTab ${sessionTab === "review" ? "active" : ""}`}
+                          onClick={() => setSessionTab("review")}
+                        >Review</button>
+                      )}
+                    </div>
+                  )}
+
+                  <div className="sessionBody">
+                    {sessionErr && <div className="error">{sessionErr}</div>}
+
+                    {!sessionData && !sessionErr && (
+                      <div className="sessionEmpty">Loading session...</div>
+                    )}
+
+                    {sessionData && !hasImpl && !hasReview && (
+                      <div className="sessionEmpty">No run logs found for this card yet.</div>
+                    )}
+
+                    {activeSession?.unsupportedFormat && (
+                      <div className="sessionUnsupported">
+                        <div>
+                          Structured session view isn't available for the <code>{selected?.assignee ?? "this"}</code> CLI yet.
+                        </div>
+                        <button
+                          className="btn"
+                          onClick={() => {
+                            setSessionOpen(false);
+                            setTermOpen(true);
+                          }}
+                        >Open raw Terminal viewer</button>
+                      </div>
+                    )}
+
+                    {activeSession && !activeSession.unsupportedFormat && (
+                      <>
+                        <div className="sessionStats">
+                          <div className="statTile">
+                            <div className="statLabel">Status</div>
+                            <div className={
+                              "statBadge " +
+                              (!activeSession.isComplete ? "running" : activeSession.isError ? "error" : "success")
+                            }>
+                              {!activeSession.isComplete ? "Running" : activeSession.isError ? "Error" : "Success"}
+                            </div>
+                          </div>
+                          <div className="statTile">
+                            <div className="statLabel">Duration{!activeSession.isComplete && activeSession.durationMs != null ? " (live)" : ""}</div>
+                            <div className="statValue">{formatMsDuration(activeSession.durationMs)}</div>
+                          </div>
+                          <div className="statTile">
+                            <div className="statLabel">API Time</div>
+                            <div className="statValue">
+                              {activeSession.apiDurationMs == null && !activeSession.isComplete
+                                ? "…"
+                                : formatMsDuration(activeSession.apiDurationMs)}
+                            </div>
+                          </div>
+                          <div className="statTile">
+                            <div className="statLabel">Turns{!activeSession.isComplete && activeSession.numTurns != null ? " (so far)" : ""}</div>
+                            <div className="statValue">{activeSession.numTurns ?? "-"}</div>
+                          </div>
+                          <div className="statTile">
+                            <div className="statLabel">Model</div>
+                            <div className="statValue statValueSmall">{activeSession.model ?? "-"}</div>
+                          </div>
+                          <div className="statTile">
+                            <div className="statLabel">Cost</div>
+                            <div className="statValue">
+                              {activeSession.totalCostUsd == null && !activeSession.isComplete
+                                ? "…"
+                                : formatCost(activeSession.totalCostUsd)}
+                            </div>
+                          </div>
+                          <div className="statTile">
+                            <div className="statLabel">Tokens In / Out{!activeSession.isComplete && activeSession.usage ? " (live)" : ""}</div>
+                            <div className="statValue statValueSmall">
+                              {formatTokenCount(activeSession.usage?.inputTokens)} / {formatTokenCount(activeSession.usage?.outputTokens)}
+                            </div>
+                          </div>
+                          <div className="statTile">
+                            <div className="statLabel">Cache Read / Write{!activeSession.isComplete && activeSession.usage ? " (live)" : ""}</div>
+                            <div className="statValue statValueSmall">
+                              {formatTokenCount(activeSession.usage?.cacheReadTokens)} / {formatTokenCount(activeSession.usage?.cacheCreationTokens)}
+                            </div>
+                          </div>
+                          <div className="statTile">
+                            <div className="statLabel">Tool Calls</div>
+                            <div className="statValue">{activeSession.toolCallCount}</div>
+                          </div>
+                        </div>
+
+                        {activeSession.rateLimitHit && (
+                          <div className="sessionRateLimitBanner">⚠ Rate limit event occurred during this session</div>
+                        )}
+
+                        <div className="sessionTimeline">
+                          {activeSession.timeline.length === 0 && (
+                            <div className="sessionEmpty">(no timeline entries yet)</div>
+                          )}
+                          {activeSession.timeline.map((entry: SessionTimelineEntry) => {
+                            if (entry.kind === "assistant_text") {
+                              return (
+                                <div key={entry.seq} className="timelineText">
+                                  {entry.text}
+                                </div>
+                              );
+                            }
+                            if (entry.kind === "notification") {
+                              return (
+                                <div key={entry.seq} className="timelineNotification">
+                                  ℹ {entry.text}
+                                </div>
+                              );
+                            }
+                            if (entry.kind === "rate_limit") {
+                              return (
+                                <div key={entry.seq} className="timelineRateLimit">
+                                  ⚠ Rate limit event
+                                </div>
+                              );
+                            }
+                            // tool_call
+                            const expanded = expandedToolCalls.has(entry.id);
+                            return (
+                              <div
+                                key={entry.seq}
+                                className={`timelineToolCall ${entry.isError ? "isError" : ""} ${expanded ? "expanded" : ""}`}
+                                onClick={() => {
+                                  setExpandedToolCalls((prev) => {
+                                    const next = new Set(prev);
+                                    if (next.has(entry.id)) next.delete(entry.id);
+                                    else next.add(entry.id);
+                                    return next;
+                                  });
+                                }}
+                              >
+                                <div className="timelineToolCallHeader">
+                                  <span className="toolCallBadge">{entry.name}</span>
+                                  {entry.summary && <span className="toolCallSummary">{entry.summary}</span>}
+                                  {entry.isError && <span className="toolCallErrorBadge">error</span>}
+                                  <span className="toolCallToggle">{expanded ? "▾" : "▸"}</span>
+                                </div>
+                                {expanded && (
+                                  <div className="timelineToolCallBody">
+                                    <div className="toolCallSectionLabel">Input</div>
+                                    <pre className="toolCallPre">{JSON.stringify(entry.input, null, 2)}</pre>
+                                    <div className="toolCallSectionLabel">Result</div>
+                                    <pre className="toolCallPre">{entry.result ?? "(no result yet)"}</pre>
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </>
+                    )}
+                  </div>
+                </>
+              );
+            })()}
           </div>
         </div>
       ) : null}

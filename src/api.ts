@@ -44,6 +44,16 @@ export interface Card {
   role?: Role;
   task_type?: TaskType;
   project_path?: string | null;
+  run_started_at?: number | null;
+  // Aggregated run stats, derived server-side from ALL of the card's card_runs rows (split by
+  // whether the run was a review run). Present only when the card has at least one run - see
+  // attachRunStats() in server/index.ts. Absent/undefined means "never run", not "zero".
+  inProgressDurationMs?: number;
+  reviewDurationMs?: number;
+  totalDurationMs?: number;
+  modelsUsed?: string[];
+  totalInputTokens?: number | null;
+  totalOutputTokens?: number | null;
 }
 
 export interface CardLog {
@@ -149,6 +159,77 @@ export async function getTerminal(
   if (!r.ok) throw new Error(`getTerminal failed: ${r.status}`);
   const j = await r.json();
   return { exists: j.exists as boolean, path: j.path as string, text: j.text as string };
+}
+
+export interface ParsedSessionUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  thinkingTokens: number;
+}
+
+export interface ParsedSessionModelUsage {
+  inputTokens: number;
+  outputTokens: number;
+  costUSD: number;
+}
+
+export type SessionTimelineEntry =
+  | { seq: number; kind: "assistant_text"; timestamp?: string; text: string }
+  | {
+      seq: number;
+      kind: "tool_call";
+      timestamp?: string;
+      id: string;
+      name: string;
+      input: unknown;
+      summary?: string;
+      result?: string;
+      isError?: boolean;
+    }
+  | { seq: number; kind: "notification"; timestamp?: string; text: string }
+  | { seq: number; kind: "rate_limit"; timestamp?: string; status?: string };
+
+export interface QuotaUtilizationSnapshot {
+  fiveHourUtilization: number | null;
+  sevenDayUtilization: number | null;
+  timestamp?: string;
+}
+
+export interface ParsedSession {
+  sessionId: string | null;
+  model: string | null;
+  isComplete: boolean;
+  isError: boolean | null;
+  stopReason: string | null;
+  subtype: string | null;
+  durationMs: number | null;
+  apiDurationMs: number | null;
+  numTurns: number | null;
+  ttftMs: number | null;
+  startedAt: string | null;
+  usage: ParsedSessionUsage | null;
+  totalCostUsd: number | null;
+  modelUsage: Record<string, ParsedSessionModelUsage> | null;
+  toolCallCount: number;
+  rateLimitHit: boolean;
+  finalResultText: string | null;
+  unsupportedFormat?: boolean;
+  timeline: SessionTimelineEntry[];
+  latestQuotaUtilization: QuotaUtilizationSnapshot | null;
+}
+
+export interface CardSessionResponse {
+  implementation: ParsedSession | null;
+  review: ParsedSession | null;
+}
+
+export async function getCardSession(id: string): Promise<CardSessionResponse> {
+  const r = await fetch(`${base}/api/cards/${id}/session`);
+  if (!r.ok && r.status !== 404) throw new Error(`getCardSession failed: ${r.status}`);
+  const j = await r.json();
+  return { implementation: j.implementation ?? null, review: j.review ?? null };
 }
 
 export async function runCard(id: string): Promise<void> {
@@ -330,3 +411,64 @@ export async function importFromOpenClaw(
   if (!r.ok) throw new Error(`importFromOpenClaw failed: ${r.status}`);
   return (await r.json()) as ImportResult;
 }
+
+export interface HarnessSyncResponse {
+  ok: boolean;
+  totalSynced: number;
+  epicsCount: number;
+  internalCount: number;
+  lastSyncedAt: number;
+  harnessDir: string;
+  error?: string;
+}
+
+export async function getHarnessStatus(): Promise<HarnessSyncResponse> {
+  const r = await fetch(`${base}/api/harness/status`);
+  if (!r.ok) throw new Error(`getHarnessStatus failed: ${r.status}`);
+  return (await r.json()) as HarnessSyncResponse;
+}
+
+export async function syncHarness(): Promise<HarnessSyncResponse> {
+  const r = await fetch(`${base}/api/harness/sync`, { method: "POST" });
+  if (!r.ok) throw new Error(`syncHarness failed: ${r.status}`);
+  return (await r.json()) as HarnessSyncResponse;
+}
+
+export interface QueueStatusResponse {
+  activeCount: number;
+  maxConcurrentTasks: number;
+  autoDispatch: boolean;
+  plannedCount: number;
+  inboxCount: number;
+  activeCardIds: string[];
+}
+
+export async function getQueueStatus(): Promise<QueueStatusResponse> {
+  const r = await fetch(`${base}/api/queue/status`);
+  if (!r.ok) throw new Error(`getQueueStatus failed: ${r.status}`);
+  return (await r.json()) as QueueStatusResponse;
+}
+
+export async function saveQueueConfig(config: { maxConcurrentTasks?: number; autoDispatch?: boolean }): Promise<{ ok: boolean; config: any }> {
+  const r = await fetch(`${base}/api/queue/config`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(config),
+  });
+  if (!r.ok) throw new Error(`saveQueueConfig failed: ${r.status}`);
+  return (await r.json()) as { ok: boolean; config: any };
+}
+
+export async function moveActiveToBacklog(): Promise<{ ok: boolean; count: number }> {
+  const r = await fetch(`${base}/api/queue/move-to-backlog`, { method: "POST" });
+  if (!r.ok) throw new Error(`moveInProgressToBacklog failed: ${r.status}`);
+  return (await r.json()) as { ok: boolean; count: number };
+}
+
+export async function dispatchNextTask(): Promise<{ dispatched: boolean; card?: any; reason?: string }> {
+  const r = await fetch(`${base}/api/queue/dispatch-next`, { method: "POST" });
+  if (!r.ok) throw new Error(`dispatchNextTask failed: ${r.status}`);
+  return (await r.json()) as { dispatched: boolean; card?: any; reason?: string };
+}
+
+

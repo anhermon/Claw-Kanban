@@ -9,6 +9,17 @@ import { DatabaseSync } from "node:sqlite";
 import { z } from "zod";
 import { WebSocket } from "ws";
 import { fileURLToPath } from "node:url";
+import { syncAgentHarness, getHarnessSyncStatus, updateHarnessStateFile } from "./harness-sync.ts";
+import { parseClaudeSessionLog } from "./session-parser.ts";
+import {
+  getQueueConfig,
+  saveQueueConfig,
+  moveActiveToBacklog,
+  getQueueStatus,
+  dispatchNextTask,
+  startQueueWorker,
+  registerRunExecutor,
+} from "./queue-dispatcher.ts";
 
 // Load .env file (no dotenv dependency needed)
 const __server_dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -245,6 +256,8 @@ function launchHttpAgent(
   logPath: string,
   controller: AbortController,
   fakePid: number,
+  runId?: number | bigint,
+  runCreatedAt?: number,
 ): void {
   const logStream = fs.createWriteStream(logPath, { flags: "w" });
 
@@ -280,6 +293,7 @@ function launchHttpAgent(
     } finally {
       await new Promise<void>((resolve) => logStream.end(resolve));
       try { fs.unlinkSync(promptPath); } catch { /* ignore */ }
+      recordRunCompletion(runId, logPath, runCreatedAt ?? Date.now());
       handleRunComplete(cardId, exitCode, projectPath);
     }
   })();
@@ -600,6 +614,22 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_oauth_credentials_provider ON oauth_creden
 
 // Migration: add project_path column (safe to re-run; silently ignored if column exists)
 try { db.exec(`ALTER TABLE cards ADD COLUMN project_path TEXT`); } catch { /* column already exists */ }
+
+// Migration: add per-run duration/model/token/cost columns to card_runs (safe to re-run;
+// silently ignored if a column already exists). Populated at run completion by
+// recordRunCompletion() below, so per-stage duration and token/cost stats survive status
+// changes instead of being derived live from a single run_started_at.
+for (const columnDdl of [
+  "ALTER TABLE card_runs ADD COLUMN duration_ms INTEGER",
+  "ALTER TABLE card_runs ADD COLUMN model TEXT",
+  "ALTER TABLE card_runs ADD COLUMN input_tokens INTEGER",
+  "ALTER TABLE card_runs ADD COLUMN output_tokens INTEGER",
+  "ALTER TABLE card_runs ADD COLUMN cache_read_tokens INTEGER",
+  "ALTER TABLE card_runs ADD COLUMN cache_creation_tokens INTEGER",
+  "ALTER TABLE card_runs ADD COLUMN cost_usd REAL",
+]) {
+  try { db.exec(columnDdl); } catch { /* column already exists */ }
+}
 
 // --- OpenClaw Gateway integration (optional) ---
 // Set OPENCLAW_CONFIG to your openclaw.json path to enable gateway wake notifications.
@@ -2191,12 +2221,108 @@ app.get("/api/oauth/models", async (_req, res) => {
   }
 });
 
+const CARDS_WITH_RUN_START_SQL = `
+  SELECT c.*, (SELECT MAX(created_at) FROM card_runs r WHERE r.card_id = c.id) AS run_started_at
+  FROM cards c
+`;
+
+// Attaches per-card aggregated run stats (persisted stage durations, models used, settled token
+// totals) computed from ALL of a card's card_runs rows, split by whether the run was a review
+// run (agent LIKE '%-review') or an implementation run. Rows never get deleted, so summing across
+// them naturally preserves duration across status changes and resumes correctly if a card cycles
+// back through a stage later - see the ticket design note in the task description this shipped
+// under. Cards with zero card_runs rows are left untouched (no stat fields added) so the ~184
+// harness-synced-but-never-run epics don't show empty/zero badges.
+function attachRunStats<T extends { id: string }>(rows: T[]): T[] {
+  if (rows.length === 0) return rows;
+
+  const ids = rows.map((r) => r.id);
+  const placeholders = ids.map(() => "?").join(",");
+  const runs = db.prepare(
+    `SELECT card_id, agent, status, created_at, duration_ms, model, input_tokens, output_tokens
+     FROM card_runs WHERE card_id IN (${placeholders})`
+  ).all(...ids) as {
+    card_id: string;
+    agent: string;
+    status: string;
+    created_at: number;
+    duration_ms: number | null;
+    model: string | null;
+    input_tokens: number | null;
+    output_tokens: number | null;
+  }[];
+
+  if (runs.length === 0) return rows;
+
+  const byCard = new Map<string, typeof runs>();
+  for (const run of runs) {
+    const list = byCard.get(run.card_id);
+    if (list) list.push(run);
+    else byCard.set(run.card_id, [run]);
+  }
+
+  const now = nowMs();
+  for (const row of rows as any[]) {
+    const cardRuns = byCard.get(row.id);
+    if (!cardRuns || cardRuns.length === 0) continue;
+
+    let inProgressDurationMs = 0;
+    let reviewDurationMs = 0;
+    let totalInputTokens = 0;
+    let totalOutputTokens = 0;
+    let hasCompletedRun = false;
+    const models = new Set<string>();
+
+    // Fallback end-time for a run whose duration_ms is still NULL ("no completion metrics
+    // recorded" - either genuinely still in flight, or a row that got orphaned open by e.g. a
+    // /stop, a raw status-changing UPDATE, or anything else that moved the card off an active
+    // stage without going through the normal completion path). Only let that fallback advance
+    // with "now" while the CARD is actually in an active stage (In Progress / Review/Test) - for
+    // any other card status the fallback end-time is frozen at the card's own updated_at, so an
+    // orphaned-open run can never make a Done/Stopped/Planned/Inbox card's duration keep growing
+    // on every poll. This is a card-status check (not the run's own `status` column) so it holds
+    // even if the run row's status was never flipped away from "running" either.
+    const cardIsActive = row.status === "In Progress" || row.status === "Review/Test";
+    const openRunEndMs = cardIsActive ? now : Number(row.updated_at);
+
+    for (const run of cardRuns) {
+      const isReview = run.agent.endsWith("-review");
+      const elapsedMs = run.duration_ms != null
+        ? Number(run.duration_ms)
+        : Math.max(0, openRunEndMs - Number(run.created_at));
+      if (isReview) reviewDurationMs += elapsedMs;
+      else inProgressDurationMs += elapsedMs;
+
+      if (run.model) models.add(run.model);
+
+      // Only count a run toward the token total when it actually carries token data - a
+      // finalized-but-never-parsed run (e.g. one repaired by finalizeOpenRunsForCard, which only
+      // fixes duration_ms and deliberately doesn't fabricate usage numbers) has duration_ms set
+      // but no real token data, and should read as "unknown" (null), not "0 in / 0 out".
+      if (run.duration_ms != null && (run.input_tokens != null || run.output_tokens != null)) {
+        hasCompletedRun = true;
+        totalInputTokens += Number(run.input_tokens ?? 0);
+        totalOutputTokens += Number(run.output_tokens ?? 0);
+      }
+    }
+
+    row.inProgressDurationMs = inProgressDurationMs;
+    row.reviewDurationMs = reviewDurationMs;
+    row.totalDurationMs = inProgressDurationMs + reviewDurationMs;
+    row.modelsUsed = Array.from(models);
+    row.totalInputTokens = hasCompletedRun ? totalInputTokens : null;
+    row.totalOutputTokens = hasCompletedRun ? totalOutputTokens : null;
+  }
+
+  return rows;
+}
+
 app.get("/api/cards", (req, res) => {
   const status = req.query.status ? CardStatus.parse(req.query.status) : undefined;
   const rows = status
-    ? db.prepare("SELECT * FROM cards WHERE status = ? ORDER BY updated_at DESC").all(status)
-    : db.prepare("SELECT * FROM cards ORDER BY updated_at DESC").all();
-  res.json({ cards: rows });
+    ? db.prepare(`${CARDS_WITH_RUN_START_SQL} WHERE c.status = ? ORDER BY c.updated_at DESC`).all(status)
+    : db.prepare(`${CARDS_WITH_RUN_START_SQL} ORDER BY c.updated_at DESC`).all();
+  res.json({ cards: attachRunStats(rows as { id: string }[]) });
 });
 
 app.get("/api/cards/search", (req, res) => {
@@ -2371,6 +2497,15 @@ app.patch("/api/cards/:id", (req, res) => {
     "INSERT INTO system_logs (created_at, kind, message) VALUES (?, ?, ?)"
   ).run(t, "system", `Card updated ${id}: ${Object.keys(patch).join(", ")}`);
 
+  // Safety net: a manual status-dropdown move (or any other direct PATCH) into Done/Stopped can
+  // leave a card_runs row open (duration_ms still NULL) if it didn't go through the normal
+  // run-completion path - e.g. a raw status UPDATE from elsewhere, or a process that never
+  // reported back. Freeze any such open rows now so the card's duration display doesn't keep
+  // growing on every poll after it's left the active stages (see attachRunStats()).
+  if (patch.status && patch.status !== existing.status && (next.status === "Done" || next.status === "Stopped")) {
+    finalizeOpenRunsForCard(id, t);
+  }
+
   const reviewToDone = existing.status === "Review/Test" && next.status === "Done";
   if (reviewToDone) {
     queueWake({
@@ -2380,7 +2515,27 @@ app.patch("/api/cards/:id", (req, res) => {
     });
   }
 
+  // Update agent-harness state file if status changed
+  if (existing.source_message_id && (existing.source === "agent-harness:internal" || existing.source === "agent-harness:jira")) {
+    if (patch.status && patch.status !== existing.status) {
+      updateHarnessStateFile(existing.source_message_id, patch.status);
+    }
+  }
+
   res.json({ ok: true });
+});
+
+app.get("/api/harness/status", (_req, res) => {
+  res.json(getHarnessSyncStatus());
+});
+
+app.post("/api/harness/sync", (_req, res) => {
+  try {
+    const stats = syncAgentHarness(db);
+    res.json(stats);
+  } catch (err: any) {
+    res.status(500).json({ ok: false, error: err.message });
+  }
 });
 
 app.get("/api/cards/:id/logs", (req, res) => {
@@ -2566,6 +2721,159 @@ app.get("/api/cards/:id/terminal", (req, res) => {
   res.json({ ok: true, exists: true, path: filePath, text });
 });
 
+// Structured session detail (AgentsView-style: tokens, cost, duration, tool-call timeline)
+// parsed natively from the card's own stream-json run logs. See server/session-parser.ts.
+app.get("/api/cards/:id/session", (req, res) => {
+  const id = String(req.params.id);
+  const implLogPath = path.join(logsDir, `${id}.log`);
+  const reviewLogPath = path.join(logsDir, `${id}.review.log`);
+
+  const implementation = parseClaudeSessionLog(implLogPath);
+  const review = parseClaudeSessionLog(reviewLogPath);
+
+  if (!implementation && !review) {
+    return res.status(404).json({ implementation: null, review: null });
+  }
+
+  res.json({ implementation, review });
+});
+
+// Populate the just-finished run's persistent stats (duration/model/tokens/cost) on its
+// card_runs row. Must run at process-completion time, before the log file at logPath can be
+// overwritten by a future run for the same card (executeCardRun/startReviewTest reuse a fixed
+// path per card: logs/{id}.log and logs/{id}.review.log).
+function recordRunCompletion(runId: number | bigint | undefined, logPath: string, startedAtMs: number) {
+  if (runId == null) return;
+  const parsed = parseClaudeSessionLog(logPath);
+  const durationMs = parsed?.durationMs ?? Math.max(0, Date.now() - startedAtMs);
+  const model = parsed?.model ?? null;
+  const usage = parsed?.usage ?? null;
+
+  db.prepare(
+    `UPDATE card_runs
+     SET duration_ms = ?, model = ?, input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_creation_tokens = ?, cost_usd = ?
+     WHERE id = ?`
+  ).run(
+    durationMs,
+    model,
+    usage?.inputTokens ?? null,
+    usage?.outputTokens ?? null,
+    usage?.cacheReadTokens ?? null,
+    usage?.cacheCreationTokens ?? null,
+    parsed?.totalCostUsd ?? null,
+    runId,
+  );
+}
+
+// Safety net for any card_runs row that's still "open" (duration_ms IS NULL) on a card that is
+// no longer actively running (e.g. stopped without going through recordRunCompletion, or a
+// direct status-changing PATCH bypassed the normal completion path entirely). Freezes each open
+// row's duration at `endMs - created_at` so it stops silently growing on every /api/cards poll -
+// this is the persisted-data counterpart to the display-time freeze in attachRunStats() above.
+// Does NOT attempt to parse the run's log for model/token/cost data (unlike recordRunCompletion):
+// by the time this runs the log may already belong to a different, later run for the same card.
+function finalizeOpenRunsForCard(cardId: string, endMs: number) {
+  const openRuns = db.prepare(
+    "SELECT id, created_at FROM card_runs WHERE card_id = ? AND duration_ms IS NULL"
+  ).all(cardId) as { id: number; created_at: number }[];
+
+  for (const run of openRuns) {
+    const durationMs = Math.max(0, endMs - Number(run.created_at));
+    db.prepare("UPDATE card_runs SET duration_ms = ?, status = ? WHERE id = ? AND duration_ms IS NULL")
+      .run(durationMs, "stopped", run.id);
+  }
+}
+
+// True only if a process with this pid genuinely still exists on this machine (signal 0 is a
+// pure existence probe - it doesn't actually deliver a signal). This, not `activeProcesses` Map
+// membership, is the only trustworthy "is this run actually still running" check: spawnAgent()
+// spawns with `detached: true` + `child.unref()` so the OS process can outlive this Node process
+// entirely - which is exactly what happened across today's incident (server restarted several
+// times while WIP-limit reset via a raw status UPDATE, real `claude` CLI child processes kept
+// running unsupervised against real repos the whole time, invisible to the fresh process's
+// in-memory activeProcesses map). A fresh server's activeProcesses map is *always* empty right
+// after boot, so keying "orphaned" off map membership alone would misclassify every genuinely
+// still-running detached child as dead on every restart.
+function isPidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Self-healing reconciliation: for every card currently claiming an active stage (In Progress /
+// Review/Test), check the real OS-level liveness of its latest run's pid for that stage.
+//   - pid confirmed dead (or never recorded) and no completion metrics were ever persisted:
+//     genuinely orphaned - finalize its stats from whatever log exists and revert the card to
+//     Planned so it isn't stuck occupying a WIP slot forever with a duration that never stops
+//     growing (see attachRunStats()).
+//   - pid still alive: leave the card and its run completely alone, even if this server process
+//     doesn't have it in `activeProcesses` (e.g. it survived a restart) - demoting or finalizing a
+//     genuinely still-running agent would abandon real in-flight work against a real repo
+//     unsupervised. Only log a WARN so the situation is visible instead of silent.
+// Called once at startup (replaces a blind moveActiveToBacklog() call there, which assumed
+// "active at boot => no live process", proven false today) and on a periodic interval to catch a
+// run dying mid-uptime (killed some other way, crashed, etc.) without waiting for the next restart.
+function reapOrphanedActiveCards(): void {
+  const activeCards = db.prepare(
+    `SELECT id, status FROM cards WHERE status IN ('In Progress', 'Review/Test')`
+  ).all() as { id: string; status: string }[];
+
+  for (const card of activeCards) {
+    const isReview = card.status === "Review/Test";
+    const agentFilter = isReview ? "agent LIKE '%-review'" : "agent NOT LIKE '%-review'";
+    const latestRun = db.prepare(
+      `SELECT id, pid, log_path, created_at, duration_ms FROM card_runs WHERE card_id = ? AND ${agentFilter} ORDER BY created_at DESC LIMIT 1`
+    ).get(card.id) as { id: number; pid: number | null; log_path: string | null; created_at: number; duration_ms: number | null } | undefined;
+
+    // No run row at all for this stage: nothing to reconcile against - leave alone (rare/defensive).
+    if (!latestRun) continue;
+
+    if (latestRun.duration_ms != null) {
+      // The latest run for this stage already has settled completion metrics - i.e. nothing is
+      // actually in flight - but the card's own status was never transitioned off the active
+      // stage (e.g. a completion handler ran against different/earlier server state, or crashed
+      // between updating card_runs and updating cards). No pid to check, nothing left to
+      // finalize - just revert the stuck status. This is the DEV-47783 case: its latest run had
+      // already recorded a real duration, so the pid-liveness check alone would never have caught
+      // it since there was nothing "open" left to examine.
+      const now = nowMs();
+      db.prepare("UPDATE cards SET status = 'Planned', updated_at = ? WHERE id = ?").run(now, card.id);
+      appendCardLog(card.id, "system", "Detected stale active status (latest run already settled, none in flight) — reverted to Planned");
+      appendSystemLog("system", `Stale active status (no in-flight run), reverted to Planned: ${card.id}`);
+      activeProcesses.delete(card.id);
+      activeProcesses.delete(`${card.id}:review`);
+      continue;
+    }
+
+    const pid = latestRun.pid;
+    if (pid != null && pid > 0 && isPidAlive(pid)) {
+      const processKey = isReview ? `${card.id}:review` : card.id;
+      if (!activeProcesses.has(processKey)) {
+        appendSystemLog(
+          "warn",
+          `Card ${card.id} (${card.status}) has a live but untracked pid ${pid} (likely survived a server restart) - leaving it running`,
+        );
+      }
+      continue;
+    }
+
+    // Confirmed dead (or no pid was ever recorded): genuinely orphaned.
+    const now = nowMs();
+    const logPath = latestRun.log_path ?? path.join(logsDir, isReview ? `${card.id}.review.log` : `${card.id}.log`);
+    recordRunCompletion(latestRun.id, logPath, latestRun.created_at);
+    finalizeOpenRunsForCard(card.id, now);
+
+    db.prepare("UPDATE cards SET status = 'Planned', updated_at = ? WHERE id = ?").run(now, card.id);
+    appendCardLog(card.id, "system", "Detected orphaned run (process no longer alive) — reverted to Planned");
+    appendSystemLog("system", `Orphaned run detected (pid ${pid ?? "unknown"} dead), reverted to Planned: ${card.id}`);
+    activeProcesses.delete(card.id);
+    activeProcesses.delete(`${card.id}:review`);
+  }
+}
+
 // Handle review completion logic (used by both in-process handler and callback endpoint)
 function handleReviewComplete(cardId: string, exitCode: number) {
   activeProcesses.delete(`${cardId}:review`);
@@ -2645,81 +2953,141 @@ If there are issues or the task is incomplete, explain clearly.`;
 
   const reviewChild = spawnAgent(cardId, "claude", reviewPrompt, projectPath, reviewLogPath, `${cardId}:review`);
 
+  const reviewRunCreatedAt = nowMs();
+  let reviewRunId: number | bigint | undefined;
   reviewChild.on("close", (code) => {
+    recordRunCompletion(reviewRunId, reviewLogPath, reviewRunCreatedAt);
     handleReviewComplete(cardId, code ?? 1);
   });
 
-  db.prepare(
+  const reviewRunInsert = db.prepare(
     "INSERT INTO card_runs (card_id, created_at, agent, pid, status, log_path, cwd) VALUES (?, ?, ?, ?, ?, ?, ?)"
-  ).run(cardId, nowMs(), "claude-review", reviewChild.pid ?? null, "running", reviewLogPath, projectPath);
+  ).run(cardId, reviewRunCreatedAt, "claude-review", reviewChild.pid ?? null, "running", reviewLogPath, projectPath);
+  reviewRunId = reviewRunInsert.lastInsertRowid;
 }
 
-// Start (or restart) a card run.
-app.post("/api/cards/:id/run", (req, res) => {
-  const id = String(req.params.id);
+// Best-effort ticket key extraction from a card title (e.g. "[EPIC] AUT-274: ..." -> "AUT-274",
+// "[INTERNAL] INT-20260818-slug: ..." -> "INT-20260818-slug"), for the Phase 0 orientation block
+// below. Returns null for manually-created cards with no recognizable ticket key.
+function extractTicketKey(title: string): string | null {
+  const m = title.match(/\bINT-\d{8}-[\w-]+\b/) || title.match(/\b[A-Z]{2,10}-\d+\b/);
+  return m ? m[0] : null;
+}
+
+// Mandatory "establish the facts first" orientation prepended to every implementation prompt.
+// Angel's own framing: verify a reported defect actually reproduces, and check for prior work on
+// the same ticket, before opening a branch - so an agent never re-fixes something already fixed
+// (the AUT-274/DEV-47783 case: Jira status was stale, but the real question was "does this repro
+// and has someone already shipped a fix nobody closed the loop on"). Deliberately plain/agent-
+// agnostic text (no tool-specific syntax) since this prompt goes to whichever CLI is assigned.
+function buildPhase0OrientationBlock(ticketKey: string | null): string {
+  const keyHint = ticketKey
+    ? `This ticket's key is ${ticketKey} - use it in the searches below.`
+    : `Identify this ticket's key (if any) from the title below and use it in the searches below.`;
+  return [
+    "Before making any changes, establish the facts first:",
+    "1. If this ticket reports a defect/bug, reproduce it in the current codebase. If you cannot reproduce it, STOP - do not implement a fix for something that doesn't exist. Report clearly that the issue could not be reproduced and why you believe it's already resolved (what you checked, what you expected vs. observed).",
+    `2. Check whether this ticket was already worked on: search git history and branches for prior work referencing this ticket's key (e.g. git log --all --oneline --grep="<TICKET-KEY>", git branch -a | grep -i <ticket-key-or-slug>). ${keyHint} If prior work exists, inspect whether it already addresses this ticket's requirements before starting fresh - don't duplicate completed work.`,
+    "3. Only proceed to implement once you've confirmed: the issue is real and reproducible (for bugfixes), and no existing branch/commit already covers it.",
+    "",
+    "---",
+    "",
+  ].join("\n");
+}
+
+// Execution engine for starting a card run
+async function executeCardRun(id: string): Promise<{ ok: boolean; pid?: number | null; logPath?: string; cwd?: string }> {
   const card = db.prepare("SELECT * FROM cards WHERE id = ?").get(id) as any;
-  if (!card) return res.status(404).json({ error: "not_found" });
+  if (!card) throw new Error("not_found");
 
   const agent = (card.assignee || "claude") as string;
-  if (!["claude", "codex", "gemini", "opencode", "copilot", "antigravity"].includes(agent)) {
-    return res.status(400).json({ error: "unsupported_agent", agent });
+  if (!["claude", "codex", "gemini", "opencode", "copilot", "antigravity", "agy"].includes(agent)) {
+    throw new Error(`unsupported_agent: ${agent}`);
   }
 
   const projectPath = resolveProjectPath(card);
-
-  // Block run if no project_path is resolved (falls back to cwd which is ambiguous)
-  if (!card.project_path && !extractProjectPath(card.description)) {
-    return res.status(400).json({
-      error: "missing_project_path",
-      message: "project_path is not set. Please set a project path before running the agent.",
-    });
-  }
   const logPath = path.join(logsDir, `${id}.log`);
-
-  const prompt = `${card.title}
-
-${card.description}`;
+  const prompt = `${buildPhase0OrientationBlock(extractTicketKey(card.title))}${card.title}\n\n${card.description}`;
 
   appendCardLog(id, "system", `RUN start requested (agent=${agent})`);
   appendSystemLog("system", `Run start ${id} agent=${agent}`);
 
-  // HTTP agents (copilot/antigravity): direct API calls, no CLI dependency.
-  // DB writes happen synchronously before async launch to avoid race conditions.
   if (agent === "copilot" || agent === "antigravity") {
     const controller = new AbortController();
     const fakePid = -(++httpAgentCounter);
+    const runCreatedAt = nowMs();
 
-    db.prepare(
+    const runInsert = db.prepare(
       "INSERT INTO card_runs (card_id, created_at, agent, pid, status, log_path, cwd) VALUES (?, ?, ?, ?, ?, ?, ?)"
-    ).run(id, nowMs(), agent, fakePid, "running", logPath, projectPath);
+    ).run(id, runCreatedAt, agent, fakePid, "running", logPath, projectPath);
+    const runId = runInsert.lastInsertRowid;
 
     db.prepare(
       "UPDATE cards SET updated_at = ?, status = ? WHERE id = ?"
     ).run(nowMs(), "In Progress", id);
 
-    // Fire-and-forget: launchHttpAgent registers in activeProcesses and handles completion
-    launchHttpAgent(id, agent, prompt, projectPath, logPath, controller, fakePid);
-
-    return res.json({ ok: true, pid: fakePid, logPath, cwd: projectPath });
+    launchHttpAgent(id, agent, prompt, projectPath, logPath, controller, fakePid, runId, runCreatedAt);
+    return { ok: true, pid: fakePid, logPath, cwd: projectPath };
   }
 
-  // CLI agents (claude, codex, gemini, opencode): spawn child process
   const child = spawnAgent(id, agent, prompt, projectPath, logPath);
-
+  const runCreatedAt = nowMs();
+  let runId: number | bigint | undefined;
   child.on("close", (code) => {
+    recordRunCompletion(runId, logPath, runCreatedAt);
     handleRunComplete(id, code ?? 1, projectPath);
   });
 
-  db.prepare(
+  const runInsert = db.prepare(
     "INSERT INTO card_runs (card_id, created_at, agent, pid, status, log_path, cwd) VALUES (?, ?, ?, ?, ?, ?, ?)"
-  ).run(id, nowMs(), agent, child.pid ?? null, "running", logPath, projectPath);
+  ).run(id, runCreatedAt, agent, child.pid ?? null, "running", logPath, projectPath);
+  runId = runInsert.lastInsertRowid;
 
-  // Move card into progress when run starts
   db.prepare(
     "UPDATE cards SET updated_at = ?, status = ? WHERE id = ?"
   ).run(nowMs(), "In Progress", id);
 
-  res.json({ ok: true, pid: child.pid ?? null, logPath, cwd: projectPath });
+  return { ok: true, pid: child.pid ?? null, logPath, cwd: projectPath };
+}
+
+// Start (or restart) a card run.
+app.post("/api/cards/:id/run", async (req, res) => {
+  const id = String(req.params.id);
+  try {
+    const result = await executeCardRun(id);
+    res.json(result);
+  } catch (err: any) {
+    if (err.message === "not_found") return res.status(404).json({ error: "not_found" });
+    if (err.message.startsWith("unsupported_agent")) return res.status(400).json({ error: err.message });
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- Queue / Gradual Processing API Endpoints ---
+app.get("/api/queue/status", (_req, res) => {
+  res.json(getQueueStatus(db));
+});
+
+app.post("/api/queue/config", (req, res) => {
+  const updated = saveQueueConfig(db, req.body ?? {});
+  res.json({ ok: true, config: updated });
+});
+
+app.post("/api/queue/move-to-backlog", (_req, res) => {
+  // moveActiveToBacklog() flips status via a raw UPDATE (WIP-limit reset), bypassing the normal
+  // run-completion path entirely - freeze any card_runs rows left open by that move so their
+  // duration doesn't keep growing once the card is back in Planned (see attachRunStats() /
+  // finalizeOpenRunsForCard() and the "Done card duration kept counting up" bug this closes).
+  const activeIds = db.prepare(`SELECT id FROM cards WHERE status IN ('In Progress', 'Review/Test')`).all() as { id: string }[];
+  const result = moveActiveToBacklog(db);
+  const finalizedAt = nowMs();
+  for (const { id } of activeIds) finalizeOpenRunsForCard(id, finalizedAt);
+  res.json({ ok: true, ...result });
+});
+
+app.post("/api/queue/dispatch-next", async (_req, res) => {
+  const result = await dispatchNextTask(db);
+  res.json(result);
 });
 
 // Stop a running card run
@@ -2754,10 +3122,23 @@ app.post("/api/cards/:id/stop", (req, res) => {
   appendCardLog(id, "system", `STOP sent to pid ${pid}`);
   appendSystemLog("system", `Stop ${id} pid=${pid}`);
 
+  const stoppedAt = nowMs();
   if (run) {
+    // Finalize this run's duration/model/token/cost from its log (same as the normal
+    // handleRunComplete/handleReviewComplete completion paths) - a /stop kill never fires the
+    // spawned process's "close" handler's own recordRunCompletion call in time, so without this
+    // the row would stay open (duration_ms NULL) forever.
+    if (run.duration_ms == null) {
+      const logPath = run.log_path ?? path.join(logsDir, run.agent?.endsWith("-review") ? `${id}.review.log` : `${id}.log`);
+      recordRunCompletion(run.id, logPath, run.created_at);
+    }
     db.prepare("UPDATE card_runs SET status = ? WHERE id = ?").run("stopped", run.id);
   }
-  db.prepare("UPDATE cards SET updated_at = ?, status = ? WHERE id = ?").run(nowMs(), "Stopped", id);
+  // Safety net: finalize any other still-open run row for this card too (e.g. an older orphaned
+  // row from before this feature shipped, or a review run left open by an implementation stop).
+  finalizeOpenRunsForCard(id, stoppedAt);
+
+  db.prepare("UPDATE cards SET updated_at = ?, status = ? WHERE id = ?").run(stoppedAt, "Stopped", id);
 
   res.json({ ok: true, stopped: true, pid });
 });
@@ -2975,4 +3356,37 @@ app.listen(PORT, HOST, () => {
   } else {
     console.log(`[Claw-Kanban] OpenClaw gateway integration: disabled (set OPENCLAW_CONFIG to enable)`);
   }
+
+  // Initial sync with Agent Harness (Jira Epics + Internal tickets)
+  try {
+    const stats = syncAgentHarness(db);
+    console.log(`[Claw-Kanban] Agent Harness connected: ${stats.totalSynced} tasks synced (${stats.epicsCount} Epics, ${stats.internalCount} Internal)`);
+  } catch (e) {
+    console.error("[Claw-Kanban] Agent Harness initial sync failed:", e);
+  }
+
+  // Queue Dispatcher & WIP Limit Engine
+  registerRunExecutor(executeCardRun);
+  // Reconcile cards still marked In Progress/Review-Test at boot. NOTE: this used to be a blind
+  // moveActiveToBacklog() call on the assumption that "still active at boot => no live process
+  // behind it (the server just started)". That assumption is false: spawnAgent() spawns detached
+  // + unref'd children that outlive this Node process across a restart, so a blind reset here was
+  // silently abandoning real running agents (proved by a real incident today - 7 real `claude` CLI
+  // processes accumulated across several restarts, still running unsupervised against real repos,
+  // while every restart's blind reset spawned yet another one via auto-dispatch). Use the
+  // pid-liveness-aware reconciler instead - it only reverts cards whose process is confirmed dead.
+  reapOrphanedActiveCards();
+  startQueueWorker(db);
+  // Same pid-liveness check on a periodic interval, so a run that dies mid-uptime (killed some
+  // other way, crashed, etc.) gets caught without waiting for the next server restart.
+  setInterval(reapOrphanedActiveCards, 30_000);
+
+  // Periodic background sync every 60 seconds
+  setInterval(() => {
+    try {
+      syncAgentHarness(db);
+    } catch (e) {
+      console.error("[Claw-Kanban] Agent Harness periodic sync failed:", e);
+    }
+  }, 60_000);
 });
