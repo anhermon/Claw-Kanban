@@ -6,13 +6,14 @@
  * Prepends kanban orchestration rules to the user's AGENTS.md.
  * This is an UPDATE, not an OVERWRITE - existing content is preserved.
  *
+ * Target: --agents-path, else $CLAW_KANBAN_AGENTS_PATH, else ./AGENTS.md
+ *
  * Usage:
  *   node scripts/setup.mjs [--agents-path /path/to/AGENTS.md]
  *   pnpm setup [-- --agents-path /path/to/AGENTS.md]
  */
 
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -20,30 +21,6 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const TEMPLATE_PATH = path.join(__dirname, "..", "templates", "AGENTS-kanban.md");
 const START_MARKER = "<!-- BEGIN claw-kanban orchestration rules -->";
 const END_MARKER = "<!-- END claw-kanban orchestration rules -->";
-
-function resolveWorkspaceDir() {
-  // Try reading workspace from openclaw.json
-  const openclawJson = path.join(os.homedir(), ".openclaw", "openclaw.json");
-  if (fs.existsSync(openclawJson)) {
-    try {
-      const cfg = JSON.parse(fs.readFileSync(openclawJson, "utf8"));
-      const w = cfg?.agents?.defaults?.workspace?.trim();
-      if (w) {
-        const resolved = w.replace(/^~/, os.homedir());
-        if (fs.existsSync(resolved)) return resolved;
-      }
-    } catch { /* ignore */ }
-  }
-
-  // Check OPENCLAW_PROFILE
-  const profile = process.env.OPENCLAW_PROFILE?.trim();
-  if (profile && profile.toLowerCase() !== "default") {
-    const profdir = path.join(os.homedir(), ".openclaw", `workspace-${profile}`);
-    if (fs.existsSync(profdir)) return profdir;
-  }
-
-  return path.join(os.homedir(), ".openclaw", "workspace");
-}
 
 function findAgentsPath() {
   // Check CLI args
@@ -53,25 +30,10 @@ function findAgentsPath() {
     return path.resolve(args[agentsIdx + 1]);
   }
 
-  // Detect workspace directory using openclaw config
-  const workspaceDir = resolveWorkspaceDir();
-
-  // Check common locations
-  const candidates = [
-    // OpenClaw workspace (detected)
-    path.join(workspaceDir, "AGENTS.md"),
-    // Current directory
-    path.join(process.cwd(), "AGENTS.md"),
-  ];
-
-  for (const candidate of candidates) {
-    if (fs.existsSync(candidate)) {
-      return candidate;
-    }
-  }
-
-  // Default: create in detected workspace
-  return path.join(workspaceDir, "AGENTS.md");
+  // Explicit override via env, else AGENTS.md in the current directory
+  const fromEnv = process.env.CLAW_KANBAN_AGENTS_PATH?.trim();
+  if (fromEnv) return path.resolve(fromEnv);
+  return path.join(process.cwd(), "AGENTS.md");
 }
 
 function main() {

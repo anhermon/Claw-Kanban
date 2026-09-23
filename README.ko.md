@@ -388,7 +388,7 @@ UI에서 **Settings**를 열어 설정:
 설정 스크립트가 워크스페이스의 `AGENTS.md`에 칸반 오케스트레이션 규칙을 추가합니다 (기존 내용은 유지):
 
 ```bash
-pnpm setup                                     # 위치 자동 감지
+pnpm setup                                     # ./AGENTS.md (또는 $CLAW_KANBAN_AGENTS_PATH)
 pnpm setup -- --agents-path /path/to/AGENTS.md  # 경로 직접 지정
 ```
 

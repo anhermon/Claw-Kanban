@@ -258,26 +258,6 @@ function removeAutoStartService() {
   }
 }
 
-function resolveWorkspaceDir() {
-  // Try reading workspace from openclaw.json
-  const openclawJson = path.join(os.homedir(), ".openclaw", "openclaw.json");
-  if (fs.existsSync(openclawJson)) {
-    try {
-      const cfg = JSON.parse(fs.readFileSync(openclawJson, "utf8"));
-      const w = cfg?.agents?.defaults?.workspace?.trim();
-      if (w) return w.replace(/^~/, os.homedir());
-    } catch { /* ignore */ }
-  }
-
-  // Check OPENCLAW_PROFILE
-  const profile = process.env.OPENCLAW_PROFILE?.trim();
-  if (profile && profile.toLowerCase() !== "default") {
-    return path.join(os.homedir(), ".openclaw", `workspace-${profile}`);
-  }
-
-  return path.join(os.homedir(), ".openclaw", "workspace");
-}
-
 function uninstall() {
   console.log("[Claw-Kanban] Uninstalling...");
 
@@ -288,11 +268,11 @@ function uninstall() {
   removeAutoStartService();
 
   // Remove kanban section from AGENTS.md
-  const workspaceDir = resolveWorkspaceDir();
   const agentsPaths = [
-    path.join(workspaceDir, "AGENTS.md"),
+    process.env.CLAW_KANBAN_AGENTS_PATH?.trim() ? path.resolve(process.env.CLAW_KANBAN_AGENTS_PATH.trim()) : null,
+    path.join(process.cwd(), "AGENTS.md"),
     path.join(ROOT, "AGENTS.md"),
-  ];
+  ].filter(Boolean);
   // Deduplicate
   const uniquePaths = [...new Set(agentsPaths)];
 

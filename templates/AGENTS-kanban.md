@@ -63,12 +63,12 @@ When receiving a message that **starts with `#`**:
 When a card appears in Inbox:
 
 1. Analyze card content -> select the appropriate CLI agent
-   - **Coding tasks**: Claude Code, Codex, or sessions_spawn
+   - **Coding tasks**: Claude Code or Codex
    - **Design/creative**: Gemini CLI (exceptional cases)
 2. **Check `project_path`** — if empty, ask the user before proceeding (the API will reject `/run` without it)
 3. **Check for existing work** — if the card has prior terminal logs, ask the user whether to continue or start fresh
 4. Move card to `In Progress`
-5. Assign to agent (background exec or sessions_spawn)
+5. Assign to agent (`POST /api/cards/<id>/run`, or a background exec)
 6. **Always include a completion hook:**
    ```bash
    curl -H "Authorization: Bearer $KANBAN_TOKEN" -s -X POST http://127.0.0.1:8788/api/wake \

@@ -101,8 +101,8 @@ Dashboard: http://127.0.0.1:8788
 This step is **required** for AI agent orchestration. It teaches your AI coding agent how to interact with the kanban board — without it, the agent cannot register tasks, route work, or manage cards.
 
 ```bash
-pnpm setup
-# This prepends orchestration rules to the workspace AGENTS.md
+pnpm setup -- --agents-path /path/to/your/AGENTS.md
+# Prepends orchestration rules to that AGENTS.md (default: ./AGENTS.md, or $CLAW_KANBAN_AGENTS_PATH)
 ```
 
 **Verify:** Your workspace `AGENTS.md` should now contain `<!-- BEGIN claw-kanban orchestration rules -->` at the top.
@@ -432,7 +432,7 @@ Default mapping:
 The setup script prepends kanban orchestration rules to your workspace `AGENTS.md`:
 
 ```bash
-pnpm setup                                     # auto-detect location
+pnpm setup                                     # ./AGENTS.md (or $CLAW_KANBAN_AGENTS_PATH)
 pnpm setup -- --agents-path /path/to/AGENTS.md  # custom path
 ```
 

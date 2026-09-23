@@ -8,7 +8,8 @@ set -euo pipefail
 #   curl -fsSL https://raw.githubusercontent.com/GreenSheep01201/Claw-Kanban/main/install.sh | bash
 #
 # Environment variables:
-#   CLAW_KANBAN_DIR  - Custom install path (default: auto-detect from openclaw workspace)
+#   CLAW_KANBAN_DIR          - Custom install path (default: ~/claw-kanban)
+#   CLAW_KANBAN_AGENTS_PATH  - AGENTS.md to prepend orchestration rules to (default: <install dir>/AGENTS.md)
 # ─────────────────────────────────────────────────────────────
 
 REPO="https://github.com/GreenSheep01201/Claw-Kanban.git"
@@ -29,55 +30,8 @@ ok()    { echo -e "${GREEN}[Claw-Kanban]${NC} $1"; }
 warn()  { echo -e "${YELLOW}[Claw-Kanban]${NC} $1"; }
 fail()  { echo -e "${RED}[Claw-Kanban]${NC} $1"; exit 1; }
 
-# ─── Detect openclaw workspace path ─────────────────────────
-# Resolution order:
-#   1. CLAW_KANBAN_DIR env var (explicit override)
-#   2. openclaw.json → agents.defaults.workspace
-#   3. OPENCLAW_PROFILE env var → ~/.openclaw/workspace-{profile}
-#   4. Default: ~/.openclaw/workspace
-
-detect_workspace_dir() {
-  local openclaw_json="$HOME/.openclaw/openclaw.json"
-
-  # Try reading agents.defaults.workspace from openclaw.json
-  if [ -f "$openclaw_json" ]; then
-    # Use node for reliable JSON parsing (available since we require Node 22+)
-    local configured
-    configured=$(node -e "
-      try {
-        const c = JSON.parse(require('fs').readFileSync('$openclaw_json','utf8'));
-        const w = c?.agents?.defaults?.workspace?.trim();
-        if (w) process.stdout.write(w.replace(/^~/, process.env.HOME));
-      } catch {}
-    " 2>/dev/null) || true
-    if [ -n "$configured" ] && [ -d "$configured" ]; then
-      echo "$configured"
-      return
-    fi
-  fi
-
-  # Check OPENCLAW_PROFILE
-  local profile="${OPENCLAW_PROFILE:-}"
-  if [ -n "$profile" ] && [ "${profile,,}" != "default" ]; then
-    local profdir="$HOME/.openclaw/workspace-${profile}"
-    if [ -d "$profdir" ]; then
-      echo "$profdir"
-      return
-    fi
-  fi
-
-  # Default
-  echo "$HOME/.openclaw/workspace"
-}
-
-# Always detect the real openclaw workspace for AGENTS.md
-WORKSPACE_DIR="$(detect_workspace_dir)"
-
-if [ -n "${CLAW_KANBAN_DIR:-}" ]; then
-  INSTALL_DIR="$CLAW_KANBAN_DIR"
-else
-  INSTALL_DIR="$WORKSPACE_DIR/kanban-dashboard"
-fi
+INSTALL_DIR="${CLAW_KANBAN_DIR:-$HOME/claw-kanban}"
+AGENTS_PATH="${CLAW_KANBAN_AGENTS_PATH:-$INSTALL_DIR/AGENTS.md}"
 
 # ─── Prerequisites ──────────────────────────────────────────
 
@@ -118,7 +72,7 @@ else
   info "tsx not found globally (will use local devDependency after install)"
 fi
 
-info "Workspace: $WORKSPACE_DIR"
+info "AGENTS.md: $AGENTS_PATH"
 info "Install:   $INSTALL_DIR"
 
 # ─── Clone / Update ─────────────────────────────────────────
@@ -162,16 +116,6 @@ PORT=${PORT}
 HOST=127.0.0.1
 EOF
 
-  # Auto-detect openclaw gateway config
-  OPENCLAW_JSON="$HOME/.openclaw/openclaw.json"
-  if [ -f "$OPENCLAW_JSON" ]; then
-    echo "OPENCLAW_CONFIG=$OPENCLAW_JSON" >> "$ENV_FILE"
-    ok "OpenClaw gateway integration: enabled"
-  else
-    echo "# OPENCLAW_CONFIG=$OPENCLAW_JSON" >> "$ENV_FILE"
-    info "OpenClaw gateway integration: disabled (config not found)"
-  fi
-
   ok ".env generated"
 else
   ok "Existing .env preserved"
@@ -180,8 +124,6 @@ fi
 # ─── Setup AGENTS.md ────────────────────────────────────────
 
 info "Setting up AGENTS.md orchestration rules..."
-# Pass the detected workspace AGENTS.md path explicitly
-AGENTS_PATH="$WORKSPACE_DIR/AGENTS.md"
 $PKG_MGR run setup -- --agents-path "$AGENTS_PATH"
 ok "AGENTS.md configured ($AGENTS_PATH)"
 
@@ -426,7 +368,7 @@ fi
 echo ""
 echo -e "  ${BOLD}Dashboard:${NC}  http://127.0.0.1:${PORT}"
 echo -e "  ${BOLD}API:${NC}        http://127.0.0.1:${PORT}/api/health"
-echo -e "  ${BOLD}Workspace:${NC}  $WORKSPACE_DIR"
+echo -e "  ${BOLD}AGENTS.md:${NC}  $AGENTS_PATH"
 echo -e "  ${BOLD}Install:${NC}    $INSTALL_DIR"
 echo ""
 if [ "$(uname)" = "Darwin" ]; then

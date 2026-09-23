@@ -11,7 +11,7 @@
 $ErrorActionPreference = "Stop"
 
 $Repo = "https://github.com/GreenSheep01201/Claw-Kanban.git"
-$DefaultDir = Join-Path $env:USERPROFILE ".openclaw\workspace\kanban-dashboard"
+$DefaultDir = Join-Path $env:USERPROFILE "claw-kanban"
 $InstallDir = if ($env:CLAW_KANBAN_DIR) { $env:CLAW_KANBAN_DIR } else { $DefaultDir }
 $Port = if ($env:CLAW_KANBAN_PORT) { $env:CLAW_KANBAN_PORT } else { "8788" }
 
@@ -125,15 +125,6 @@ if (-not (Test-Path $EnvFile)) {
 PORT=$Port
 HOST=127.0.0.1
 "@
-
-    $openclawJson = Join-Path $env:USERPROFILE ".openclaw\openclaw.json"
-    if (Test-Path $openclawJson) {
-        $envContent += "`nOPENCLAW_CONFIG=$openclawJson"
-        Write-Ok "OpenClaw gateway integration: enabled"
-    } else {
-        $envContent += "`n# OPENCLAW_CONFIG=$openclawJson"
-        Write-Info "OpenClaw gateway integration: disabled (config not found)"
-    }
 
     Set-Content -Path $EnvFile -Value $envContent -Encoding UTF8
     Write-Ok ".env generated"
