@@ -82,10 +82,10 @@ pnpm build      # or: npm run build
 
 ```bash
 pnpm start
-# Server starts at http://127.0.0.1:8787
+# Server starts at http://127.0.0.1:8788
 ```
 
-**Verify:** `curl -s http://127.0.0.1:8787/api/health` should return `{"ok":true, ...}`.
+**Verify:** `curl -s http://127.0.0.1:8788/api/health` should return `{"ok":true, ...}`.
 
 ### Step 3: Open the Dashboard
 
@@ -93,7 +93,7 @@ Tell the user:
 
 ```
 Claw-Kanban is installed and running!
-Dashboard: http://127.0.0.1:8787
+Dashboard: http://127.0.0.1:8788
 ```
 
 ### Step 3.5: AGENTS.md Setup (Required)
@@ -114,7 +114,7 @@ For development with hot reload:
 ```bash
 pnpm dev        # localhost only (127.0.0.1)
 pnpm dev:local  # same as pnpm dev (kept for compatibility)
-# UI: http://127.0.0.1:5173  |  API: http://127.0.0.1:8787
+# UI: http://127.0.0.1:5173  |  API: http://127.0.0.1:8788
 ```
 
 ### Troubleshooting
@@ -122,7 +122,7 @@ pnpm dev:local  # same as pnpm dev (kept for compatibility)
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | `pnpm build` fails with "node:sqlite" error | Node.js < 22 | Upgrade to Node.js 22+: `nvm install 22 && nvm use 22` |
-| Port 8787 already in use | Another process on port | `lsof -i :8787` to find it, or set `PORT=9999 pnpm start` |
+| Port 8788 already in use | Another process on port | `lsof -i :8788` to find it, or set `PORT=9999 pnpm start` |
 | `curl /api/health` connection refused | Server not running | Run `pnpm start` from the Claw-Kanban directory |
 | No AI providers shown in Settings | CLI tools not installed | Install at least one: `npm i -g @anthropic-ai/claude-code` |
 | Provider shows "Not Authenticated" | CLI tool not logged in | Run the auth command: `claude login`, `codex auth login`, or `gemini auth login` |
@@ -285,8 +285,8 @@ For LAN/Tailscale access, run the production server with a token (see [Remote ac
 
 | | URL |
 |---|---|
-| **UI** | http://127.0.0.1:5173 (dev) or http://127.0.0.1:8787 (prod) |
-| **API** | http://127.0.0.1:8787 |
+| **UI** | http://127.0.0.1:5173 (dev) or http://127.0.0.1:8788 (prod) |
+| **API** | http://127.0.0.1:8788 |
 
 ## How It Works
 
@@ -312,12 +312,12 @@ Set it in the UI card detail panel, or via API:
 
 ```bash
 # When creating a card
-curl -X POST http://127.0.0.1:8787/api/cards \
+curl -X POST http://127.0.0.1:8788/api/cards \
   -H 'content-type: application/json' \
   -d '{"title":"fix bug","description":"...","project_path":"/Users/me/projects/my-app"}'
 
 # When updating an existing card
-curl -X PATCH http://127.0.0.1:8787/api/cards/<id> \
+curl -X PATCH http://127.0.0.1:8788/api/cards/<id> \
   -H 'content-type: application/json' \
   -d '{"project_path":"/Users/me/projects/my-app"}'
 ```
@@ -334,7 +334,7 @@ Fix the login button style
 **3. Webhook with project_path:**
 
 ```bash
-curl -X POST http://127.0.0.1:8787/api/inbox \
+curl -X POST http://127.0.0.1:8788/api/inbox \
   -H 'content-type: application/json' \
   -d '{"text":"fix the build","source":"telegram","project_path":"/Users/me/projects/my-app"}'
 ```
@@ -381,11 +381,11 @@ cp .env.example .env
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PORT` | `8787` | API server port |
+| `PORT` | `8788` | API server port |
 | `HOST` | `127.0.0.1` | Bind address (`0.0.0.0` for LAN/Tailscale; requires `KANBAN_TOKEN`) |
 | `KANBAN_TOKEN` | *(empty)* | Bearer token (min 16 chars) required on all `/api/*` calls when set. **Mandatory** when `HOST` is not loopback: the server refuses to start without it. |
 | `KANBAN_DISABLE_DISPATCH` | *(empty)* | `1` blocks every agent launch (manual run, queue dispatch, auto-review) with `409 dispatch_disabled`. For dry runs against a copy of a real board. |
-| `KANBAN_ALLOWED_ORIGINS` | *(empty)* | Extra comma-separated browser origins allowed by CORS (e.g. `http://my-mac.tailnet.ts.net:8787`). The board's own `127.0.0.1`/`localhost` origins on `PORT` and `5173` are always allowed. |
+| `KANBAN_ALLOWED_ORIGINS` | *(empty)* | Extra comma-separated browser origins allowed by CORS (e.g. `http://my-mac.tailnet.ts.net:8788`). The board's own `127.0.0.1`/`localhost` origins on `PORT` and `5173` are always allowed. |
 | `DB_PATH` | `./kanban.sqlite` | SQLite database file path |
 | `LOGS_DIR` | `./logs` | Agent terminal log directory |
 | `OPENCLAW_CONFIG` | *(empty)* | Path to `openclaw.json` for gateway wake integration |
@@ -563,11 +563,11 @@ HOST=0.0.0.0
 KANBAN_TOKEN=<output of: openssl rand -hex 32>
 # If you open the board via a hostname/IP other than 127.0.0.1/localhost and use
 # cross-origin clients, list those origins too (same-origin browser use needs nothing extra):
-# KANBAN_ALLOWED_ORIGINS=http://my-mac.tailnet.ts.net:8787
+# KANBAN_ALLOWED_ORIGINS=http://my-mac.tailnet.ts.net:8788
 ```
 
 1. `pnpm build && pnpm start` (or `pnpm kanban restart`).
-2. In the browser, open `http://<host>:8787/?token=<KANBAN_TOKEN>` once. The server sets an HttpOnly
+2. In the browser, open `http://<host>:8788/?token=<KANBAN_TOKEN>` once. The server sets an HttpOnly
    `kanban_token` cookie and redirects to the clean URL; later visits need no token in the URL.
 3. CLI/agent clients send `Authorization: Bearer $KANBAN_TOKEN` (the AGENTS.md template does this).
    `pnpm kanban` reads `KANBAN_TOKEN` from the environment or `.env`.

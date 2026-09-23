@@ -12,7 +12,7 @@ set -euo pipefail
 # ─────────────────────────────────────────────────────────────
 
 REPO="https://github.com/GreenSheep01201/Claw-Kanban.git"
-PORT="${CLAW_KANBAN_PORT:-8787}"
+PORT="${CLAW_KANBAN_PORT:-8788}"
 LAUNCHD_LABEL="ai.openclaw.kanban"
 LAUNCHD_LEGACY_LABEL="com.openclaw.kanban"
 

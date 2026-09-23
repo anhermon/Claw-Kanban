@@ -45,7 +45,7 @@ const PKG_VERSION: string = JSON.parse(
   fs.readFileSync(path.resolve(__server_dirname, "..", "package.json"), "utf8"),
 ).version ?? "1.0.0";
 
-const PORT = Number(process.env.PORT ?? 8787);
+const PORT = Number(process.env.PORT ?? 8788);
 const HOST = process.env.HOST ?? "127.0.0.1"; // set 0.0.0.0 for Tailscale/LAN (requires KANBAN_TOKEN)
 const KANBAN_TOKEN = (process.env.KANBAN_TOKEN ?? "").trim();
 

@@ -34,19 +34,19 @@ Add to `.env` (server reads `.env` without `dotenv`):
 OAUTH_ENCRYPTION_SECRET="change-me-to-a-long-random-string"
 
 # Optional if you need to override callback host
-OAUTH_BASE_URL="http://127.0.0.1:8787"
+OAUTH_BASE_URL="http://127.0.0.1:8788"
 
 # GitHub OAuth app (Settings → Developer settings → OAuth Apps)
 OAUTH_GITHUB_CLIENT_ID="..."
 OAUTH_GITHUB_CLIENT_SECRET="..."
 # Callback URL:
-#   http://127.0.0.1:8787/api/oauth/github/callback
+#   http://127.0.0.1:8788/api/oauth/github/callback
 
 # Google OAuth app (Google Cloud Console → OAuth consent screen)
 OAUTH_GOOGLE_CLIENT_ID="..."
 OAUTH_GOOGLE_CLIENT_SECRET="..."
 # Authorized redirect URI:
-#   http://127.0.0.1:8787/api/oauth/google-antigravity/callback
+#   http://127.0.0.1:8788/api/oauth/google-antigravity/callback
 ```
 
 ## Copilot note

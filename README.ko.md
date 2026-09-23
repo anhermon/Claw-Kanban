@@ -73,10 +73,10 @@ pnpm build      # 또는: npm run build
 
 ```bash
 pnpm start
-# 서버가 http://127.0.0.1:8787 에서 시작됩니다
+# 서버가 http://127.0.0.1:8788 에서 시작됩니다
 ```
 
-**검증:** `curl -s http://127.0.0.1:8787/api/health` 가 `{"ok":true, ...}` 를 반환해야 합니다.
+**검증:** `curl -s http://127.0.0.1:8788/api/health` 가 `{"ok":true, ...}` 를 반환해야 합니다.
 
 ### Step 3: 대시보드 열기
 
@@ -84,7 +84,7 @@ pnpm start
 
 ```
 Claw-Kanban이 설치 완료되어 실행 중입니다!
-대시보드: http://127.0.0.1:8787
+대시보드: http://127.0.0.1:8788
 ```
 
 ### Step 3.5: AGENTS.md 설정 (필수)
@@ -105,7 +105,7 @@ pnpm setup
 ```bash
 pnpm dev        # localhost 전용 (127.0.0.1)
 pnpm dev:local  # localhost만 (127.0.0.1)
-# UI: http://127.0.0.1:5173  |  API: http://127.0.0.1:8787
+# UI: http://127.0.0.1:5173  |  API: http://127.0.0.1:8788
 ```
 
 ### 문제 해결
@@ -113,7 +113,7 @@ pnpm dev:local  # localhost만 (127.0.0.1)
 | 증상 | 원인 | 해결 |
 |------|------|------|
 | `pnpm build`에서 "node:sqlite" 오류 | Node.js 22 미만 | Node.js 22+로 업그레이드: `nvm install 22 && nvm use 22` |
-| 포트 8787 이미 사용 중 | 다른 프로세스가 포트 점유 | `lsof -i :8787`로 확인하거나, `PORT=9999 pnpm start`로 포트 변경 |
+| 포트 8788 이미 사용 중 | 다른 프로세스가 포트 점유 | `lsof -i :8788`로 확인하거나, `PORT=9999 pnpm start`로 포트 변경 |
 | `curl /api/health` 연결 거부 | 서버 미실행 | Claw-Kanban 디렉토리에서 `pnpm start` 실행 |
 | Settings에 AI 프로바이더 없음 | CLI 도구 미설치 | 최소 하나 설치: `npm i -g @anthropic-ai/claude-code` |
 | 프로바이더 "Not Authenticated" 표시 | CLI 도구 미로그인 | 인증 명령 실행: `claude login`, `codex auth login`, 또는 `gemini auth login` |
@@ -276,8 +276,8 @@ pnpm dev:local
 
 | | URL |
 |---|---|
-| **UI** | http://127.0.0.1:5173 (개발) 또는 http://127.0.0.1:8787 (프로덕션) |
-| **API** | http://127.0.0.1:8787 |
+| **UI** | http://127.0.0.1:5173 (개발) 또는 http://127.0.0.1:8788 (프로덕션) |
+| **API** | http://127.0.0.1:8788 |
 
 ## 동작 방식
 
@@ -353,7 +353,7 @@ cp .env.example .env
 
 | 변수 | 기본값 | 설명 |
 |------|--------|------|
-| `PORT` | `8787` | API 서버 포트 |
+| `PORT` | `8788` | API 서버 포트 |
 | `HOST` | `127.0.0.1` | 바인드 주소 (LAN/Tailscale 접근 시 `0.0.0.0`, `KANBAN_TOKEN` 필수) |
 | `KANBAN_TOKEN` | *(비어 있음)* | 설정 시 모든 `/api/*` 호출에 `Authorization: Bearer <token>` 필요 (최소 16자). 비-루프백 `HOST`에서는 필수이며 없으면 서버가 시작을 거부합니다. |
 | `KANBAN_ALLOWED_ORIGINS` | *(비어 있음)* | CORS 허용 origin 추가 목록 (쉼표 구분) |

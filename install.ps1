@@ -13,7 +13,7 @@ $ErrorActionPreference = "Stop"
 $Repo = "https://github.com/GreenSheep01201/Claw-Kanban.git"
 $DefaultDir = Join-Path $env:USERPROFILE ".openclaw\workspace\kanban-dashboard"
 $InstallDir = if ($env:CLAW_KANBAN_DIR) { $env:CLAW_KANBAN_DIR } else { $DefaultDir }
-$Port = if ($env:CLAW_KANBAN_PORT) { $env:CLAW_KANBAN_PORT } else { "8787" }
+$Port = if ($env:CLAW_KANBAN_PORT) { $env:CLAW_KANBAN_PORT } else { "8788" }
 
 function Write-Info  { param($Msg) Write-Host "[Claw-Kanban] $Msg" -ForegroundColor Cyan }
 function Write-Ok    { param($Msg) Write-Host "[Claw-Kanban] $Msg" -ForegroundColor Green }

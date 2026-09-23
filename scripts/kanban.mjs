@@ -62,7 +62,7 @@ function readEnvValue(key) {
 
 function getPort() {
   const port = readEnvValue("PORT");
-  return /^\d+$/.test(port) ? port : "8787";
+  return /^\d+$/.test(port) ? port : "8788";
 }
 
 // Address the script itself can reach: the bind HOST, unless it's a wildcard bind.
