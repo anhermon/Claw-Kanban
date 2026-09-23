@@ -82,6 +82,72 @@ const RECOGNIZED_TYPES = new Set([
   "result",
 ]);
 
+// Loose shape of one Claude stream-json line - only the fields this parser reads. Every field is
+// optional/unknown because lines come from an external CLI and are validated at each use site.
+interface StreamUsage {
+  input_tokens?: number;
+  output_tokens?: number;
+  cache_read_input_tokens?: number;
+  cache_creation_input_tokens?: number;
+  output_tokens_details?: { thinking_tokens?: number };
+}
+
+interface StreamContentBlock {
+  type?: string;
+  text?: unknown;
+  id?: unknown;
+  name?: unknown;
+  input?: unknown;
+  tool_use_id?: unknown;
+  content?: unknown;
+  is_error?: unknown;
+}
+
+interface StreamMessage {
+  id?: unknown;
+  model?: unknown;
+  usage?: StreamUsage;
+  content?: unknown;
+}
+
+interface StreamRateLimitInfo {
+  status?: unknown;
+  unifiedWindows?: {
+    five_hour?: { utilization?: unknown };
+    seven_day?: { utilization?: unknown };
+  };
+}
+
+interface StreamModelUsage {
+  inputTokens?: number;
+  outputTokens?: number;
+  costUSD?: number;
+}
+
+interface StreamEvent {
+  type?: unknown;
+  timestamp?: string;
+  session_id?: unknown;
+  subtype?: string | null;
+  summary?: unknown;
+  message?: StreamMessage;
+  rate_limit_info?: StreamRateLimitInfo;
+  usage?: StreamUsage;
+  modelUsage?: Record<string, StreamModelUsage | null | undefined>;
+  is_error?: unknown;
+  stop_reason?: string | null;
+  duration_ms?: number | null;
+  duration_api_ms?: number | null;
+  num_turns?: number | null;
+  ttft_ms?: number | null;
+  total_cost_usd?: number | null;
+  result?: unknown;
+}
+
+function contentBlocks(message: StreamMessage | undefined): StreamContentBlock[] {
+  return Array.isArray(message?.content) ? (message.content as StreamContentBlock[]) : [];
+}
+
 interface ToolResultContentBlock {
   type?: string;
   text?: string;
@@ -152,7 +218,7 @@ export function parseClaudeSessionLog(logPath: string): ParsedSession | null {
   const rawLines = raw.split(/\r?\n/).filter((l) => l.trim().length > 0);
   if (rawLines.length === 0) return null;
 
-  const events: any[] = [];
+  const events: StreamEvent[] = [];
   for (const line of rawLines) {
     try {
       events.push(JSON.parse(line));
@@ -166,7 +232,7 @@ export function parseClaudeSessionLog(logPath: string): ParsedSession | null {
 
   let anyRecognized = false;
   for (const e of events) {
-    if (e && typeof e === "object" && RECOGNIZED_TYPES.has(e.type)) {
+    if (e && typeof e === "object" && typeof e.type === "string" && RECOGNIZED_TYPES.has(e.type)) {
       anyRecognized = true;
       break;
     }
@@ -200,7 +266,7 @@ export function parseClaudeSessionLog(logPath: string): ParsedSession | null {
   let model: string | null = null;
   let startedAt: string | null = null;
   let rateLimitHit = false;
-  let resultEvent: any = null;
+  let resultEvent: StreamEvent | null = null;
   let latestQuotaUtilization: QuotaUtilizationSnapshot | null = null;
 
   const timeline: TimelineEntry[] = [];
@@ -233,7 +299,7 @@ export function parseClaudeSessionLog(logPath: string): ParsedSession | null {
 
     switch (e.type) {
       case "assistant": {
-        const message = e.message ?? {};
+        const message: StreamMessage = e.message ?? {};
         if (!model && typeof message.model === "string") model = message.model;
 
         // A given assistant *message* (message.id) can be split across several stream-json
@@ -242,15 +308,14 @@ export function parseClaudeSessionLog(logPath: string): ParsedSession | null {
         if (typeof message.id === "string" && !seenTurnMessageIds.has(message.id)) {
           seenTurnMessageIds.add(message.id);
           turnsSoFar++;
-          const u = message.usage ?? {};
+          const u: StreamUsage = message.usage ?? {};
           runningInputTokens += Number(u.input_tokens ?? 0);
           runningOutputTokens += Number(u.output_tokens ?? 0);
           runningCacheReadTokens += Number(u.cache_read_input_tokens ?? 0);
           runningCacheCreationTokens += Number(u.cache_creation_input_tokens ?? 0);
         }
 
-        const content = Array.isArray(message.content) ? message.content : [];
-        for (const block of content) {
+        for (const block of contentBlocks(message)) {
           if (!block || typeof block !== "object") continue;
           if (block.type === "text" && typeof block.text === "string" && block.text.length > 0) {
             timeline.push({ seq: seq++, kind: "assistant_text", timestamp: e.timestamp, text: block.text });
@@ -274,9 +339,7 @@ export function parseClaudeSessionLog(logPath: string): ParsedSession | null {
         break;
       }
       case "user": {
-        const message = e.message ?? {};
-        const content = Array.isArray(message.content) ? message.content : [];
-        for (const block of content) {
+        for (const block of contentBlocks(e.message)) {
           if (!block || typeof block !== "object" || block.type !== "tool_result") continue;
           const toolUseId = block.tool_use_id;
           if (typeof toolUseId !== "string") continue;
@@ -298,7 +361,7 @@ export function parseClaudeSessionLog(logPath: string): ParsedSession | null {
         break;
       }
       case "rate_limit_event": {
-        const info = e.rate_limit_info ?? {};
+        const info: StreamRateLimitInfo = e.rate_limit_info ?? {};
         const status = typeof info.status === "string" ? info.status : null;
 
         // `status: "allowed"` is routine quota-utilization telemetry - the request WAS allowed,
@@ -333,7 +396,7 @@ export function parseClaudeSessionLog(logPath: string): ParsedSession | null {
   let usage: ParsedSessionUsage | null = null;
   let modelUsage: Record<string, ParsedSessionModelUsage> | null = null;
   if (resultEvent) {
-    const u = resultEvent.usage ?? {};
+    const u: StreamUsage = resultEvent.usage ?? {};
     usage = {
       inputTokens: Number(u.input_tokens ?? 0),
       outputTokens: Number(u.output_tokens ?? 0),
@@ -344,7 +407,7 @@ export function parseClaudeSessionLog(logPath: string): ParsedSession | null {
 
     if (resultEvent.modelUsage && typeof resultEvent.modelUsage === "object") {
       modelUsage = {};
-      for (const [modelName, mu] of Object.entries<any>(resultEvent.modelUsage)) {
+      for (const [modelName, mu] of Object.entries(resultEvent.modelUsage)) {
         modelUsage[modelName] = {
           inputTokens: Number(mu?.inputTokens ?? 0),
           outputTokens: Number(mu?.outputTokens ?? 0),
