@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Modified by Angel Hermon (2026) from Claw-Kanban by GreenSheep01201; Apache-2.0 (see LICENSE).
 set -euo pipefail
 
 # ─────────────────────────────────────────────────────────────

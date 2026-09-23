@@ -1,3 +1,4 @@
+# Modified by Angel Hermon (2026) from Claw-Kanban by GreenSheep01201; Apache-2.0 (see LICENSE).
 # ─────────────────────────────────────────────────────────────
 # Claw-Kanban one-click installer (Windows PowerShell)
 #

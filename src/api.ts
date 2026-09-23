@@ -1,3 +1,4 @@
+// Modified by Angel Hermon (2026) from Claw-Kanban by GreenSheep01201; Apache-2.0 (see LICENSE).
 export type CardStatus = "Inbox" | "Planned" | "In Progress" | "Review/Test" | "Done" | "Stopped";
 export type Assignee = "claude" | "codex" | "gemini" | "opencode" | "copilot" | "antigravity" | "agy" | null;
 export type Role = "devops" | "backend" | "frontend";
