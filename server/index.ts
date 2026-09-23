@@ -73,16 +73,24 @@ app.use(express.json({ limit: "2mb" }));
 const OAUTH_BASE_URL = process.env.OAUTH_BASE_URL || `http://${HOST}:${PORT}`;
 const OAUTH_ENCRYPTION_SECRET = process.env.OAUTH_ENCRYPTION_SECRET || process.env.SESSION_SECRET || "";
 
-// Built-in OAuth credentials (same as OpenClaw's built-in values)
+// Built-in GitHub OAuth client id (public device-flow app id; no secret involved).
 const BUILTIN_GITHUB_CLIENT_ID = "Iv1.b507a08c87ecfe98";
-const BUILTIN_GOOGLE_CLIENT_ID = Buffer.from(
-  "MTA3MTAwNjA2MDU5MS10bWhzc2luMmgyMWxjcmUyMzV2dG9sb2poNGc0MDNlcC5hcHBzLmdvb2dsZXVzZXJjb250ZW50LmNvbQ==",
-  "base64",
-).toString();
-const BUILTIN_GOOGLE_CLIENT_SECRET = Buffer.from(
-  "R09DU1BYLUs1OEZXUjQ4NkxkTEoxbUxCOHNYQzR6NnFEQWY=",
-  "base64",
-).toString();
+
+// Google OAuth (Antigravity) has no built-in credentials: bring your own OAuth client.
+const GOOGLE_OAUTH_NOT_CONFIGURED =
+  "Google OAuth is not configured: set OAUTH_GOOGLE_CLIENT_ID and OAUTH_GOOGLE_CLIENT_SECRET in .env";
+
+function googleOAuthClient(): { clientId: string; clientSecret: string } | null {
+  const clientId = process.env.OAUTH_GOOGLE_CLIENT_ID?.trim() || "";
+  const clientSecret = process.env.OAUTH_GOOGLE_CLIENT_SECRET?.trim() || "";
+  return clientId && clientSecret ? { clientId, clientSecret } : null;
+}
+
+function requireGoogleOAuthClient(): { clientId: string; clientSecret: string } {
+  const client = googleOAuthClient();
+  if (!client) throw new Error(GOOGLE_OAUTH_NOT_CONFIGURED);
+  return client;
+}
 
 function oauthEncryptionKey(): Buffer {
   // Derive a stable 32-byte key from env secret (minimal v1).
@@ -1179,8 +1187,7 @@ function startGitHubOAuth(redirectTo: string, callbackPath: string): string {
 
 function startGoogleAntigravityOAuth(redirectTo: string, callbackPath: string): string {
   requireOAuthStorageReady();
-  const clientId = process.env.OAUTH_GOOGLE_CLIENT_ID ?? BUILTIN_GOOGLE_CLIENT_ID;
-  if (!clientId) throw new Error("missing_OAUTH_GOOGLE_CLIENT_ID");
+  const { clientId } = requireGoogleOAuthClient();
 
   cleanupOAuthStates();
   const verifier = pkceVerifier();
@@ -1250,8 +1257,7 @@ async function refreshGoogleToken(credential: DecryptedOAuthToken): Promise<stri
   if (!credential.refreshToken) {
     throw new Error("Google OAuth token expired and no refresh_token available");
   }
-  const clientId = process.env.OAUTH_GOOGLE_CLIENT_ID ?? BUILTIN_GOOGLE_CLIENT_ID;
-  const clientSecret = process.env.OAUTH_GOOGLE_CLIENT_SECRET ?? BUILTIN_GOOGLE_CLIENT_SECRET;
+  const { clientId, clientSecret } = requireGoogleOAuthClient();
   const resp = await fetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -1341,6 +1347,7 @@ function buildOAuthStatus() {
     },
     antigravity: {
       provider: "antigravity" as const,
+      configured: googleOAuthClient() !== null,
       connected: Boolean(antigravity),
       source: antigravity ? "google_antigravity" : null,
       email: antigravity?.email ?? null,
@@ -1699,12 +1706,12 @@ async function handleGoogleAntigravityCallback(req: express.Request, res: expres
   if (!row) return res.status(400).send("Invalid or expired state");
 
   const redirectTo = sanitizeOAuthRedirect(row.redirect_to ?? "/");
-  const clientId = process.env.OAUTH_GOOGLE_CLIENT_ID ?? BUILTIN_GOOGLE_CLIENT_ID;
-  const clientSecret = process.env.OAUTH_GOOGLE_CLIENT_SECRET ?? BUILTIN_GOOGLE_CLIENT_SECRET;
-  if (!clientId || !clientSecret) {
+  const googleClient = googleOAuthClient();
+  if (!googleClient) {
     const fail = appendOAuthQuery(redirectTo, "oauth_error", "google_env_missing");
     return res.redirect(302, fail);
   }
+  const { clientId, clientSecret } = googleClient;
 
   let verifier = "";
   try {

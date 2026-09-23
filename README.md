@@ -391,6 +391,7 @@ cp .env.example .env
 | `OPENCLAW_CONFIG` | *(empty)* | Path to `openclaw.json` for gateway wake integration |
 | `OAUTH_ENCRYPTION_SECRET` | *(empty)* | **Required for OAuth Connect**. Secret used to encrypt OAuth tokens at rest (AES-256-GCM). Can reuse `SESSION_SECRET`. |
 | `OAUTH_BASE_URL` | `http://HOST:PORT` | Public base URL used to build OAuth redirect URIs (set if HOST/PORT differ from browser access) |
+| `OAUTH_GOOGLE_CLIENT_ID` / `OAUTH_GOOGLE_CLIENT_SECRET` | *(empty)* | Your Google OAuth client for Antigravity connect. Required for that provider; there is no built-in fallback. |
 | `ANTIGRAVITY_GITHUB_CLIENT_ID` | *(empty)* | GitHub OAuth App client id for `antigravity` provider |
 | `ANTIGRAVITY_GITHUB_CLIENT_SECRET` | *(empty)* | GitHub OAuth App client secret for `antigravity` provider |
 | `ANTIGRAVITY_GITHUB_SCOPE` | `read:user user:email` | GitHub OAuth scopes requested by `antigravity` provider |
@@ -584,7 +585,7 @@ Claw-Kanban is a **local development tool**. Important notes:
 - **Environment Inheritance** — Child processes inherit the server's environment.
 - **CORS** — Only the board's own origins (`http://127.0.0.1|localhost:PORT` and the Vite dev port `5173`) plus `KANBAN_ALLOWED_ORIGINS` get `Access-Control-Allow-Origin`. State-changing requests from any other origin are rejected with 403. Do not expose to the public internet.
 - **OAuth token storage** — OAuth tokens are stored **server-side only** in SQLite and encrypted at rest using `OAUTH_ENCRYPTION_SECRET` (AES-256-GCM). The browser never receives refresh tokens.
-- **Built-in OAuth Client IDs** — The GitHub and Google OAuth client IDs/secrets embedded in the source code are **public OAuth app credentials**, not user secrets. Per [Google's documentation](https://developers.google.com/identity/protocols/oauth2/native-app), client secrets for installed/desktop apps are "not treated as a secret." This is standard practice for open-source apps (VS Code, Thunderbird, GitHub CLI, etc.). These credentials only identify the app itself — your personal tokens are always encrypted separately.
+- **OAuth client credentials** — Only the public GitHub device-flow client id is built in. Google OAuth (Antigravity) needs your own client: set `OAUTH_GOOGLE_CLIENT_ID` and `OAUTH_GOOGLE_CLIENT_SECRET`, otherwise the connect flow fails with a "Google OAuth is not configured" error. No client secret ships in the source.
 - **No personal credentials in source** — All user-specific tokens (GitHub, Google OAuth) are stored encrypted in the local SQLite database, never in source code. The encryption key is derived from your `OAUTH_ENCRYPTION_SECRET` environment variable.
 - **Copilot token caching** — Exchanged Copilot session tokens are cached in-memory only (never written to disk) and auto-expire. Cache is invalidated on re-authentication.
 
