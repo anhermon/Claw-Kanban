@@ -384,6 +384,7 @@ cp .env.example .env
 | `PORT` | `8787` | API server port |
 | `HOST` | `127.0.0.1` | Bind address (`0.0.0.0` for LAN/Tailscale; requires `KANBAN_TOKEN`) |
 | `KANBAN_TOKEN` | *(empty)* | Bearer token (min 16 chars) required on all `/api/*` calls when set. **Mandatory** when `HOST` is not loopback: the server refuses to start without it. |
+| `KANBAN_DISABLE_DISPATCH` | *(empty)* | `1` blocks every agent launch (manual run, queue dispatch, auto-review) with `409 dispatch_disabled`. For dry runs against a copy of a real board. |
 | `KANBAN_ALLOWED_ORIGINS` | *(empty)* | Extra comma-separated browser origins allowed by CORS (e.g. `http://my-mac.tailnet.ts.net:8787`). The board's own `127.0.0.1`/`localhost` origins on `PORT` and `5173` are always allowed. |
 | `DB_PATH` | `./kanban.sqlite` | SQLite database file path |
 | `LOGS_DIR` | `./logs` | Agent terminal log directory |

@@ -196,6 +196,14 @@ function buildAgentArgs(agent: string, prompt?: string): string[] {
   }
 }
 
+// KANBAN_DISABLE_DISPATCH=1 turns off every agent launch path (manual /run, queue dispatch,
+// auto-review) - for dry runs / tests against a copy of a real board without launching agents.
+const DISPATCH_DISABLED = /^(1|true|yes)$/i.test(process.env.KANBAN_DISABLE_DISPATCH ?? "");
+
+function assertDispatchEnabled(): void {
+  if (DISPATCH_DISABLED) throw new Error("dispatch_disabled");
+}
+
 // Spawn an agent process with prompt delivered via stdin (cross-platform safe).
 // Prompt is also saved to a temp file for debugging.
 function spawnAgent(
@@ -206,6 +214,7 @@ function spawnAgent(
   logPath: string,
   processKey?: string,
 ): ChildProcess {
+  assertDispatchEnabled();
   // Save prompt to temp file for debugging/auditing
   const promptPath = path.join(logsDir, `${cardId}.prompt.txt`);
   fs.writeFileSync(promptPath, prompt, "utf8");
@@ -273,6 +282,7 @@ function launchHttpAgent(
   runId?: number | bigint,
   runCreatedAt?: number,
 ): void {
+  assertDispatchEnabled();
   const logStream = fs.createWriteStream(logPath, { flags: "w" });
 
   // Save prompt for debugging
@@ -3009,6 +3019,7 @@ function buildPhase0OrientationBlock(ticketKey: string | null): string {
 
 // Execution engine for starting a card run
 async function executeCardRun(id: string): Promise<{ ok: boolean; pid?: number | null; logPath?: string; cwd?: string }> {
+  assertDispatchEnabled();
   const card = db.prepare("SELECT * FROM cards WHERE id = ?").get(id) as any;
   if (!card) throw new Error("not_found");
 
@@ -3070,6 +3081,7 @@ app.post("/api/cards/:id/run", async (req, res) => {
     res.json(result);
   } catch (err: any) {
     if (err.message === "not_found") return res.status(404).json({ error: "not_found" });
+    if (err.message === "dispatch_disabled") return res.status(409).json({ error: "dispatch_disabled" });
     if (err.message.startsWith("unsupported_agent")) return res.status(400).json({ error: err.message });
     res.status(500).json({ error: err.message });
   }
@@ -3358,6 +3370,7 @@ if (isProduction) {
 
 app.listen(PORT, HOST, () => {
   console.log(`[Claw-Kanban] v${PKG_VERSION} listening on http://${HOST}:${PORT} (db: ${dbPath})`);
+  if (DISPATCH_DISABLED) console.log("[Claw-Kanban] agent dispatch: DISABLED (KANBAN_DISABLE_DISPATCH)");
   console.log(
     `[Claw-Kanban] auth: ${KANBAN_TOKEN ? "bearer token required on /api/*" : "none"}` +
       ` (${isLoopbackHost(HOST) ? "loopback only" : "network exposed"})`,
