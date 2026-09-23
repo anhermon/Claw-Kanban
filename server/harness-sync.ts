@@ -74,7 +74,6 @@ export function syncAgentHarness(db: DatabaseSync): HarnessSyncResult {
   const harnessDir = getHarnessDataDir();
   const stateDir = path.join(harnessDir, "state");
   const jiraStatusesPath = path.join(harnessDir, "jira-statuses.json");
-  const configPath = path.join(harnessDir, "config.json");
 
   if (!fs.existsSync(harnessDir)) {
     return {
@@ -86,15 +85,6 @@ export function syncAgentHarness(db: DatabaseSync): HarnessSyncResult {
       harnessDir,
       error: `Harness directory not found at ${harnessDir}`,
     };
-  }
-
-  let config: Record<string, any> = {};
-  try {
-    if (fs.existsSync(configPath)) {
-      config = JSON.parse(fs.readFileSync(configPath, "utf8"));
-    }
-  } catch (e) {
-    console.error("[Harness Sync] Error reading config.json:", e);
   }
 
   let jiraStatuses: Record<string, any> = {};

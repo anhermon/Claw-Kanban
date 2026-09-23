@@ -12,7 +12,6 @@ import { fileURLToPath } from "node:url";
 import { syncAgentHarness, getHarnessSyncStatus, updateHarnessStateFile } from "./harness-sync.ts";
 import { parseClaudeSessionLog } from "./session-parser.ts";
 import {
-  getQueueConfig,
   saveQueueConfig,
   moveActiveToBacklog,
   getQueueStatus,
@@ -1770,8 +1769,6 @@ app.get("/api/oauth/antigravity/callback", async (req, res) => {
 });
 
 // --- OpenClaw Auth-Profiles Import ---
-
-type OpenClawProfileType = "oauth" | "token";
 
 interface OpenClawOAuthProfile {
   type: "oauth";
