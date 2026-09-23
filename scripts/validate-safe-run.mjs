@@ -83,16 +83,20 @@ function listeningPids(port) {
   }
 }
 
-// fetch() may normalise the Host header, so the DNS-rebinding check uses a raw request.
-function rawGetStatus(port, urlPath, headers) {
+// fetch() may normalise Host/Cookie headers, so header-sensitive checks use raw requests.
+function rawRequestStatus(port, urlPath, { method = "GET", headers = {}, body } = {}) {
   return new Promise((resolve, reject) => {
-    const req = http.request({ host: "127.0.0.1", port, path: urlPath, method: "GET", headers }, (res) => {
+    const req = http.request({ host: "127.0.0.1", port, path: urlPath, method, headers }, (res) => {
       res.resume();
       resolve(res.statusCode);
     });
     req.on("error", reject);
-    req.end();
+    req.end(body);
   });
+}
+
+function rawGetStatus(port, urlPath, headers) {
+  return rawRequestStatus(port, urlPath, { headers });
 }
 
 function sqliteScalar(dbPath, sql) {
@@ -354,6 +358,23 @@ async function main() {
     check("[token] wrong-token POST -> 401", postBadTok.status === 401, `got ${postBadTok.status}`);
     const postTok = await fetch(`${base3}/api/cards`, { method: "POST", headers: { "content-type": "application/json", ...auth }, body: body3 });
     check("[token] POST with bearer token -> 200", postTok.status === 200, `got ${postTok.status}`);
+
+    // LAN-style browser writes: the dashboard's own origin is NOT in the allowlist (think
+    // http://100.x.y.z:PORT), so writes pass only via the same-origin rule + cookie. 127.0.0.2 is
+    // loopback (passes the Host check) but not allowlisted, so it exercises exactly that path.
+    const lanHost = `127.0.0.2:${port3}`;
+    const lanWrite = (headers) =>
+      rawRequestStatus(port3, "/api/cards", {
+        method: "POST",
+        headers: { Host: lanHost, "content-type": "application/json", ...headers },
+        body: JSON.stringify({ title: `validate-safe-run lan ${Date.now()}-${Math.random()}`, project_path: ctx.work }),
+      });
+    const lanOk = await lanWrite({ Origin: `http://${lanHost}`, Cookie: `kanban_token=${token}` });
+    check("[token] same-origin (non-allowlisted) write with cookie -> 200", lanOk === 200, `got ${lanOk}`);
+    const lanNoCookie = await lanWrite({ Origin: `http://${lanHost}` });
+    check("[token] same-origin write without cookie -> 401 (auth, not origin)", lanNoCookie === 401, `got ${lanNoCookie}`);
+    const lanForeign = await lanWrite({ Origin: `http://127.0.0.3:${port3}`, Cookie: `kanban_token=${token}` });
+    check("[token] foreign-origin write even with cookie -> 403", lanForeign === 403, `got ${lanForeign}`);
 
     const ui3 = await checkUi(browser, `${base3}/?token=${token}`, { expectCardTitle: title3, label: "token via ?token= cookie" });
     check("[token] ?token= is stripped from the URL after cookie bootstrap", !ui3.finalUrl.includes("token="), ui3.finalUrl.replace(token, "<token>"));
