@@ -6,8 +6,8 @@
   "scripts": {
     "start": "tsx server/index.ts",
     "kanban": "node scripts/kanban.mjs",
-    "dev": "concurrently -n web,api -c cyan,magenta \"cross-env VITE_DEV=1 vite --host 127.0.0.1 --port 5173\" \"cross-env VITE_DEV=1 HOST=127.0.0.1 nodemon --watch server --ext ts --exec tsx server/index.ts\"",
-    "dev:local": "concurrently -n web,api -c cyan,magenta \"cross-env VITE_DEV=1 vite --host 127.0.0.1 --port 5173\" \"cross-env VITE_DEV=1 HOST=127.0.0.1 nodemon --watch server --ext ts --exec tsx server/index.ts\"",
+    "dev": "concurrently -n web,api -c cyan,magenta \"cross-env VITE_DEV=1 vite --host 127.0.0.1 --port 5173 --strictPort\" \"cross-env VITE_DEV=1 HOST=127.0.0.1 nodemon --watch server --ext ts --exec tsx server/index.ts\"",
+    "dev:local": "concurrently -n web,api -c cyan,magenta \"cross-env VITE_DEV=1 vite --host 127.0.0.1 --port 5173 --strictPort\" \"cross-env VITE_DEV=1 HOST=127.0.0.1 nodemon --watch server --ext ts --exec tsx server/index.ts\"",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
     "preview": "vite preview",
