@@ -5,6 +5,11 @@
 > It defines how the AI agent should handle kanban task orchestration.
 > Place this at the TOP of your AGENTS.md so it takes priority.
 
+**API auth:** every `curl` below sends `Authorization: Bearer $KANBAN_TOKEN`. When the board is
+exposed beyond localhost (`HOST=0.0.0.0` for LAN/Tailscale) the server requires that token on all
+`/api/*` calls; export the same `KANBAN_TOKEN` in the agent's environment. On a localhost-only
+board with no token configured the header is ignored.
+
 ---
 
 ## Language Rule
@@ -40,7 +45,7 @@ When receiving a message that **starts with `#`**:
 1. Recognize it as a task request
 2. Strip the `#` prefix and POST to the kanban API:
    ```bash
-   curl -X POST http://127.0.0.1:8787/api/inbox \
+   curl -H "Authorization: Bearer $KANBAN_TOKEN" -X POST http://127.0.0.1:8787/api/inbox \
      -H 'content-type: application/json' \
      -d '{"source":"telegram","text":"<message content>"}'
    ```
@@ -66,7 +71,7 @@ When a card appears in Inbox:
 5. Assign to agent (background exec or sessions_spawn)
 6. **Always include a completion hook:**
    ```bash
-   curl -s -X POST http://127.0.0.1:8787/api/wake \
+   curl -H "Authorization: Bearer $KANBAN_TOKEN" -s -X POST http://127.0.0.1:8787/api/wake \
      -H 'content-type: application/json' \
      -d '{"text":"Done [cardID]: <result summary>"}'
    ```
@@ -100,7 +105,7 @@ When spawning any coding agent (even outside the kanban board), always include a
 
 ```bash
 # On task completion, notify via gateway wake
-curl -s -X POST http://127.0.0.1:8787/api/wake \
+curl -H "Authorization: Bearer $KANBAN_TOKEN" -s -X POST http://127.0.0.1:8787/api/wake \
   -H 'content-type: application/json' \
   -d '{"text":"Done: <brief result summary>"}'
 ```
@@ -127,7 +132,7 @@ The API server **blocks** `/run` and `/review` when `project_path` is empty (ret
 Before starting a new agent run, check if the card already has previous runs:
 
 ```bash
-curl http://127.0.0.1:8787/api/cards/<id>/terminal?lines=20
+curl -H "Authorization: Bearer $KANBAN_TOKEN" http://127.0.0.1:8787/api/cards/<id>/terminal?lines=20
 ```
 
 If the terminal log exists and contains prior work (non-empty output), ask the user (in their language):
@@ -147,7 +152,7 @@ card.project_path → description "## Project Path" section → ask user (MUST)
 When creating cards via the API, always include `project_path` if known:
 
 ```bash
-curl -X POST http://127.0.0.1:8787/api/inbox \
+curl -H "Authorization: Bearer $KANBAN_TOKEN" -X POST http://127.0.0.1:8787/api/inbox \
   -H 'content-type: application/json' \
   -d '{"source":"telegram","text":"fix the build","project_path":"/Users/me/my-project"}'
 ```
@@ -158,26 +163,26 @@ If the source message does not contain a project path, do NOT include `project_p
 
 ```bash
 # List Inbox cards
-curl http://127.0.0.1:8787/api/cards?status=Inbox
+curl -H "Authorization: Bearer $KANBAN_TOKEN" http://127.0.0.1:8787/api/cards?status=Inbox
 
 # Create a card with project_path
-curl -X POST http://127.0.0.1:8787/api/cards \
+curl -H "Authorization: Bearer $KANBAN_TOKEN" -X POST http://127.0.0.1:8787/api/cards \
   -H 'content-type: application/json' \
   -d '{"title":"fix bug","description":"...","project_path":"/Users/me/my-project"}'
 
 # Update card status and project_path
-curl -X PATCH http://127.0.0.1:8787/api/cards/<id> \
+curl -H "Authorization: Bearer $KANBAN_TOKEN" -X PATCH http://127.0.0.1:8787/api/cards/<id> \
   -H 'content-type: application/json' \
   -d '{"status":"In Progress","project_path":"/Users/me/my-project"}'
 
 # View terminal log
-curl http://127.0.0.1:8787/api/cards/<id>/terminal?lines=50
+curl -H "Authorization: Bearer $KANBAN_TOKEN" http://127.0.0.1:8787/api/cards/<id>/terminal?lines=50
 
 # Run agent on a card
-curl -X POST http://127.0.0.1:8787/api/cards/<id>/run
+curl -H "Authorization: Bearer $KANBAN_TOKEN" -X POST http://127.0.0.1:8787/api/cards/<id>/run
 
 # Stop a running agent
-curl -X POST http://127.0.0.1:8787/api/cards/<id>/stop
+curl -H "Authorization: Bearer $KANBAN_TOKEN" -X POST http://127.0.0.1:8787/api/cards/<id>/stop
 ```
 
 ## Git Safety Rule
@@ -197,7 +202,7 @@ Even though the repo is under git, agents must NOT create commits by default.
 When an agent needs to commit changes, it must request approval via wake notification:
 
 ```bash
-curl -s -X POST http://127.0.0.1:8787/api/wake \
+curl -H "Authorization: Bearer $KANBAN_TOKEN" -s -X POST http://127.0.0.1:8787/api/wake \
   -H 'content-type: application/json' \
   -d '{"text":"Approval needed: git commit for [card title] - [changes summary]"}'
 ```

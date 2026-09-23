@@ -45,16 +45,44 @@ function isProcessAlive(pid) {
   }
 }
 
-function getPort() {
+// Resolve a setting the same way the server does: process env first, then ROOT/.env.
+function readEnvValue(key) {
+  const fromProcess = process.env[key]?.trim();
+  if (fromProcess) return fromProcess;
   try {
     const envPath = path.join(ROOT, ".env");
     if (fs.existsSync(envPath)) {
       const content = fs.readFileSync(envPath, "utf8");
-      const match = content.match(/^PORT=(\d+)/m);
-      if (match) return match[1];
+      const match = content.match(new RegExp(`^${key}=(.*)$`, "m"));
+      if (match) return match[1].trim();
     }
   } catch { /* ignore */ }
-  return "8787";
+  return "";
+}
+
+function getPort() {
+  const port = readEnvValue("PORT");
+  return /^\d+$/.test(port) ? port : "8787";
+}
+
+// Address the script itself can reach: the bind HOST, unless it's a wildcard bind.
+function getClientHost() {
+  const host = readEnvValue("HOST");
+  if (!host || host === "0.0.0.0" || host === "::") return "127.0.0.1";
+  return host.includes(":") ? `[${host}]` : host;
+}
+
+// Sent on API calls so the script keeps working when the server requires KANBAN_TOKEN
+// (always the case when HOST is non-loopback).
+function authHeaders() {
+  const token = readEnvValue("KANBAN_TOKEN");
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+function printTokenHint() {
+  if (readEnvValue("KANBAN_TOKEN")) {
+    console.log("[Claw-Kanban] Auth: KANBAN_TOKEN set. First browser visit: append ?token=<KANBAN_TOKEN> to the dashboard URL.");
+  }
 }
 
 function findTsx() {
@@ -77,7 +105,7 @@ async function start() {
   if (pid && isProcessAlive(pid)) {
     const port = getPort();
     console.log(`[Claw-Kanban] Already running (PID: ${pid})`);
-    console.log(`[Claw-Kanban] Dashboard: http://127.0.0.1:${port}`);
+    console.log(`[Claw-Kanban] Dashboard: http://${getClientHost()}:${port}`);
     return;
   }
 
@@ -119,15 +147,16 @@ async function start() {
   for (let i = 0; i < 10; i++) {
     await new Promise((r) => setTimeout(r, 500));
     try {
-      const res = await fetch(`http://127.0.0.1:${port}/api/health`);
+      const res = await fetch(`http://${getClientHost()}:${port}/api/health`, { headers: authHeaders() });
       if (res.ok) { healthy = true; break; }
     } catch { /* not ready yet */ }
   }
 
   if (healthy) {
     console.log(`[Claw-Kanban] Server started (PID: ${child.pid})`);
-    console.log(`[Claw-Kanban] Dashboard: http://127.0.0.1:${port}`);
+    console.log(`[Claw-Kanban] Dashboard: http://${getClientHost()}:${port}`);
     console.log(`[Claw-Kanban] Log file:  ${LOG_FILE}`);
+    printTokenHint();
   } else {
     console.log(`[Claw-Kanban] Server spawned (PID: ${child.pid}) but health check did not pass.`);
     console.log(`[Claw-Kanban] Check the log: ${LOG_FILE}`);
@@ -180,8 +209,8 @@ function status() {
   if (isProcessAlive(pid)) {
     console.log(`[Claw-Kanban] Server is running`);
     console.log(`  PID:       ${pid}`);
-    console.log(`  Dashboard: http://127.0.0.1:${port}`);
-    console.log(`  API:       http://127.0.0.1:${port}/api/health`);
+    console.log(`  Dashboard: http://${getClientHost()}:${port}`);
+    console.log(`  API:       http://${getClientHost()}:${port}/api/health`);
     console.log(`  Log:       ${LOG_FILE}`);
     console.log(`  Data:      ${path.join(ROOT, "kanban.sqlite")}`);
   } else {

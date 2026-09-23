@@ -112,8 +112,8 @@ pnpm setup
 For development with hot reload:
 
 ```bash
-pnpm dev        # LAN accessible (0.0.0.0)
-pnpm dev:local  # localhost only (127.0.0.1)
+pnpm dev        # localhost only (127.0.0.1)
+pnpm dev:local  # same as pnpm dev (kept for compatibility)
 # UI: http://127.0.0.1:5173  |  API: http://127.0.0.1:8787
 ```
 
@@ -277,12 +277,11 @@ pnpm build
 # Production (serves built UI)
 pnpm start
 
-# Development (Vite HMR + API with hot reload, LAN accessible)
+# Development (Vite HMR + API with hot reload, localhost only)
 pnpm dev
-
-# Development (localhost only)
-pnpm dev:local
 ```
+
+For LAN/Tailscale access, run the production server with a token (see [Remote access](#remote-access-lan--tailscale)).
 
 | | URL |
 |---|---|
@@ -383,7 +382,9 @@ cp .env.example .env
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `PORT` | `8787` | API server port |
-| `HOST` | `127.0.0.1` | Bind address (`0.0.0.0` for LAN/Tailscale) |
+| `HOST` | `127.0.0.1` | Bind address (`0.0.0.0` for LAN/Tailscale; requires `KANBAN_TOKEN`) |
+| `KANBAN_TOKEN` | *(empty)* | Bearer token (min 16 chars) required on all `/api/*` calls when set. **Mandatory** when `HOST` is not loopback: the server refuses to start without it. |
+| `KANBAN_ALLOWED_ORIGINS` | *(empty)* | Extra comma-separated browser origins allowed by CORS (e.g. `http://my-mac.tailnet.ts.net:8787`). The board's own `127.0.0.1`/`localhost` origins on `PORT` and `5173` are always allowed. |
 | `DB_PATH` | `./kanban.sqlite` | SQLite database file path |
 | `LOGS_DIR` | `./logs` | Agent terminal log directory |
 | `OPENCLAW_CONFIG` | *(empty)* | Path to `openclaw.json` for gateway wake integration |
@@ -553,14 +554,34 @@ The `/api/cli-status` endpoint checks each tool:
 
 Results are cached for 30 seconds. Use `?refresh=1` to force re-check.
 
+## Remote access (LAN / Tailscale)
+
+```bash
+# .env
+HOST=0.0.0.0
+KANBAN_TOKEN=<output of: openssl rand -hex 32>
+# If you open the board via a hostname/IP other than 127.0.0.1/localhost and use
+# cross-origin clients, list those origins too (same-origin browser use needs nothing extra):
+# KANBAN_ALLOWED_ORIGINS=http://my-mac.tailnet.ts.net:8787
+```
+
+1. `pnpm build && pnpm start` (or `pnpm kanban restart`).
+2. In the browser, open `http://<host>:8787/?token=<KANBAN_TOKEN>` once. The server sets an HttpOnly
+   `kanban_token` cookie and redirects to the clean URL; later visits need no token in the URL.
+3. CLI/agent clients send `Authorization: Bearer $KANBAN_TOKEN` (the AGENTS.md template does this).
+   `pnpm kanban` reads `KANBAN_TOKEN` from the environment or `.env`.
+
+`pnpm dev` stays on 127.0.0.1; remote access is only supported through the production server.
+
 ## Security
 
 Claw-Kanban is a **local development tool**. Important notes:
 
-- **No Authentication** — Bind to `127.0.0.1` (default). Only use `0.0.0.0` on trusted networks (VPN/Tailscale).
+- **Loopback by default** — The server binds `127.0.0.1` unless `HOST` says otherwise. On a loopback bind, requests whose `Host` header isn't a loopback name are rejected (blocks DNS rebinding).
+- **Token for network exposure** — A non-loopback `HOST` requires `KANBAN_TOKEN`; the server refuses to start without it. With a token set, every `/api/*` call except `/api/health` needs `Authorization: Bearer <token>` (or the `kanban_token` cookie the browser receives after visiting the dashboard once with `?token=<token>`).
 - **Agent Permission Flags** — `--dangerously-skip-permissions` (Claude), `--yolo` (Codex/Gemini) are used for autonomous operation.
 - **Environment Inheritance** — Child processes inherit the server's environment.
-- **CORS** — Open CORS enabled for Vite dev proxy. Do not expose to the public internet.
+- **CORS** — Only the board's own origins (`http://127.0.0.1|localhost:PORT` and the Vite dev port `5173`) plus `KANBAN_ALLOWED_ORIGINS` get `Access-Control-Allow-Origin`. State-changing requests from any other origin are rejected with 403. Do not expose to the public internet.
 - **OAuth token storage** — OAuth tokens are stored **server-side only** in SQLite and encrypted at rest using `OAUTH_ENCRYPTION_SECRET` (AES-256-GCM). The browser never receives refresh tokens.
 - **Built-in OAuth Client IDs** — The GitHub and Google OAuth client IDs/secrets embedded in the source code are **public OAuth app credentials**, not user secrets. Per [Google's documentation](https://developers.google.com/identity/protocols/oauth2/native-app), client secrets for installed/desktop apps are "not treated as a secret." This is standard practice for open-source apps (VS Code, Thunderbird, GitHub CLI, etc.). These credentials only identify the app itself — your personal tokens are always encrypted separately.
 - **No personal credentials in source** — All user-specific tokens (GitHub, Google OAuth) are stored encrypted in the local SQLite database, never in source code. The encryption key is derived from your `OAUTH_ENCRYPTION_SECRET` environment variable.

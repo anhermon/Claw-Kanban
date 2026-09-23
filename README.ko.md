@@ -103,7 +103,7 @@ pnpm setup
 핫 리로드로 개발하려면:
 
 ```bash
-pnpm dev        # LAN 접근 가능 (0.0.0.0)
+pnpm dev        # localhost 전용 (127.0.0.1)
 pnpm dev:local  # localhost만 (127.0.0.1)
 # UI: http://127.0.0.1:5173  |  API: http://127.0.0.1:8787
 ```
@@ -354,7 +354,9 @@ cp .env.example .env
 | 변수 | 기본값 | 설명 |
 |------|--------|------|
 | `PORT` | `8787` | API 서버 포트 |
-| `HOST` | `127.0.0.1` | 바인드 주소 (LAN/Tailscale 접근 시 `0.0.0.0`) |
+| `HOST` | `127.0.0.1` | 바인드 주소 (LAN/Tailscale 접근 시 `0.0.0.0`, `KANBAN_TOKEN` 필수) |
+| `KANBAN_TOKEN` | *(비어 있음)* | 설정 시 모든 `/api/*` 호출에 `Authorization: Bearer <token>` 필요 (최소 16자). 비-루프백 `HOST`에서는 필수이며 없으면 서버가 시작을 거부합니다. |
+| `KANBAN_ALLOWED_ORIGINS` | *(비어 있음)* | CORS 허용 origin 추가 목록 (쉼표 구분) |
 | `DB_PATH` | `./kanban.sqlite` | SQLite 데이터베이스 파일 경로 |
 | `LOGS_DIR` | `./logs` | 에이전트 터미널 로그 디렉토리 |
 | `OPENCLAW_CONFIG` | *(비어있음)* | 게이트웨이 웨이크 연동을 위한 `openclaw.json` 경로 |
@@ -508,10 +510,10 @@ GET /api/health    # { ok, version, dbPath, gateway }
 
 Claw-Kanban은 **로컬 개발 도구**입니다. 주의 사항:
 
-- **인증 없음** — 기본값 `127.0.0.1`로 바인딩. 신뢰할 수 있는 네트워크(VPN/Tailscale)에서만 `0.0.0.0` 사용.
+- **인증** — 기본값 `127.0.0.1`로 바인딩. `0.0.0.0` 등 비-루프백 바인딩은 `KANBAN_TOKEN`이 필요합니다 (브라우저는 `?token=<token>`으로 한 번 접속). 자세한 내용은 README.md의 "Remote access" 참조.
 - **에이전트 권한 플래그** — `--dangerously-skip-permissions` (Claude), `--yolo` (Codex/Gemini)로 자율 실행.
 - **환경 변수 상속** — 자식 프로세스가 서버의 환경 변수를 상속받음.
-- **CORS** — Vite 개발 프록시를 위해 오픈 CORS 활성화. 공개 인터넷에 노출하지 마세요.
+- **CORS** — 보드 자체 origin(`127.0.0.1`/`localhost`의 `PORT`, `5173`)과 `KANBAN_ALLOWED_ORIGINS`만 허용. 그 외 origin의 상태 변경 요청은 403. 공개 인터넷에 노출하지 마세요.
 - **OAuth 토큰 저장** — OAuth 토큰은 **서버 측 SQLite에만 저장**되며 `OAUTH_ENCRYPTION_SECRET` 환경 변수를 사용해 AES-256-GCM으로 암호화됩니다. 브라우저에는 refresh token이 전달되지 않습니다.
 - **내장 OAuth Client ID** — 소스 코드에 포함된 GitHub/Google OAuth client ID와 secret은 **공개 OAuth 앱 자격증명**이며 사용자 비밀이 아닙니다. [Google 문서](https://developers.google.com/identity/protocols/oauth2/native-app)에 따르면 설치형/데스크톱 앱의 client secret은 "secret으로 취급하지 않습니다." VS Code, Thunderbird, GitHub CLI 등 오픈소스 앱도 동일한 방식을 사용합니다. 이 자격증명은 앱 자체를 식별할 뿐 — 사용자 개인 토큰은 항상 별도로 암호화 저장됩니다.
 - **소스 코드에 개인 자격증명 없음** — 사용자별 토큰(GitHub, Google OAuth)은 로컬 SQLite에 암호화 저장되며 소스 코드에 포함되지 않습니다. 암호화 키는 `OAUTH_ENCRYPTION_SECRET` 환경 변수에서 생성됩니다.

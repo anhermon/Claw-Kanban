@@ -1,5 +1,4 @@
 import express from "express";
-import cors from "cors";
 import path from "path";
 import fs from "node:fs";
 import os from "node:os";
@@ -11,6 +10,7 @@ import { WebSocket } from "ws";
 import { fileURLToPath } from "node:url";
 import { syncAgentHarness, getHarnessSyncStatus, updateHarnessStateFile } from "./harness-sync.ts";
 import { parseClaudeSessionLog } from "./session-parser.ts";
+import { checkBindSafety, createSecurityMiddleware, isLoopbackHost } from "./security.ts";
 import {
   saveQueueConfig,
   moveActiveToBacklog,
@@ -46,10 +46,25 @@ const PKG_VERSION: string = JSON.parse(
 ).version ?? "1.0.0";
 
 const PORT = Number(process.env.PORT ?? 8787);
-const HOST = process.env.HOST ?? "127.0.0.1"; // set 0.0.0.0 for Tailscale/LAN
+const HOST = process.env.HOST ?? "127.0.0.1"; // set 0.0.0.0 for Tailscale/LAN (requires KANBAN_TOKEN)
+const KANBAN_TOKEN = (process.env.KANBAN_TOKEN ?? "").trim();
+
+// Checked before the DB is opened so a refused start leaves no side effects behind.
+const bindSafetyError = checkBindSafety(HOST, KANBAN_TOKEN);
+if (bindSafetyError) {
+  console.error(`[Claw-Kanban] ${bindSafetyError}`);
+  process.exit(1);
+}
 
 const app = express();
-app.use(cors());
+app.use(
+  createSecurityMiddleware({
+    host: HOST,
+    port: PORT,
+    token: KANBAN_TOKEN,
+    extraAllowedOrigins: process.env.KANBAN_ALLOWED_ORIGINS ?? "",
+  }),
+);
 app.use(express.json({ limit: "2mb" }));
 
 // --- OAuth extension (optional) ---
@@ -3343,6 +3358,10 @@ if (isProduction) {
 
 app.listen(PORT, HOST, () => {
   console.log(`[Claw-Kanban] v${PKG_VERSION} listening on http://${HOST}:${PORT} (db: ${dbPath})`);
+  console.log(
+    `[Claw-Kanban] auth: ${KANBAN_TOKEN ? "bearer token required on /api/*" : "none"}` +
+      ` (${isLoopbackHost(HOST) ? "loopback only" : "network exposed"})`,
+  );
   if (isProduction) {
     console.log(`[Claw-Kanban] mode: production (serving UI from ${distDir})`);
   } else {
