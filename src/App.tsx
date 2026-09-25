@@ -19,6 +19,7 @@ import type {
   CardSessionResponse,
   ParsedSession,
   SessionTimelineEntry,
+  RecentSession,
 } from "./api";
 import {
   createCard,
@@ -48,6 +49,7 @@ import {
   saveQueueConfig,
   moveActiveToBacklog,
   dispatchNextTask,
+  getRecentSessions,
   type QueueStatusResponse,
 } from "./api";
 
@@ -78,6 +80,11 @@ const OAUTH_PROVIDERS: { value: OAuthConnectProvider; label: string; desc: strin
   { value: "antigravity", label: "Antigravity (Google)", desc: "Google OAuth for Antigravity token flow" },
   { value: "github-copilot", label: "GitHub / Copilot", desc: "GitHub OAuth for Copilot-linked workflows" },
 ];
+
+// Source filter - persists the picked card.source across reloads so Angel doesn't have to
+// re-pick it after every refresh while isolating the cards from one harness sync/source among
+// the ~180 synced cards.
+const SOURCE_FILTER_STORAGE_KEY = "clawKanban.sourceFilter";
 
 function fmtTime(ms: number) {
   const d = new Date(ms);
@@ -115,6 +122,30 @@ function formatCompactTokenCount(n: number | null | undefined): string {
   return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, "")}M`;
 }
 
+// Elapsed-time formatting for the session overlay line below - deliberately coarser than
+// formatMsDuration (drops seconds once minutes/hours are showing) to keep the compact card line
+// short, e.g. "48h 25m" rather than "48h 25m 3s".
+function formatElapsedCompact(ms: number): string {
+  const totalMinutes = Math.floor(ms / 60_000);
+  const h = Math.floor(totalMinutes / 60);
+  const m = totalMinutes % 60;
+  if (h > 0) return `${h}h ${m}m`;
+  if (m > 0) return `${m}m`;
+  return `${Math.floor(ms / 1000)}s`;
+}
+
+// Compact one-line summary for the live-session overlay (design doc §4 "Passive correlation"),
+// e.g. "674 msgs · 487k tokens · health 44 · 48h 25m". Rendered on the card face only when
+// `card.session` is present (see attachSessionOverlay() in server/index.ts).
+function cardSessionSummary(session: NonNullable<Card["session"]>): string {
+  return [
+    `${session.message_count.toLocaleString()} msgs`,
+    `${formatCompactTokenCount(session.total_output_tokens)} tokens`,
+    `health ${session.health_score}`,
+    formatElapsedCompact(session.elapsed_ms),
+  ].join(" · ");
+}
+
 // Card-level per-stage duration summary, derived from the card's persisted+live run stats
 // (inProgressDurationMs/reviewDurationMs/totalDurationMs, populated server-side from ALL of the
 // card's card_runs rows - see attachRunStats() in server/index.ts). Returns null for cards with
@@ -148,6 +179,38 @@ function cardDurationSummary(c: Card): { text: string; title: string } | null {
   return { text: parts.join(" · "), title: "Time spent per stage across all runs on this card" };
 }
 
+// Compact "started X ago" for the session-filter picker (design doc section 6) - this repo has
+// no existing relative-time helper to match, so kept deliberately simple/coarse rather than
+// pulling in a date library.
+function formatRelativeStart(iso: string): string {
+  const ms = Date.now() - Date.parse(iso);
+  if (!Number.isFinite(ms) || ms < 0) return "just now";
+  const mins = Math.floor(ms / 60_000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  return `${days}d ago`;
+}
+
+// Terse label for one session-filter option: project + truncated branch + relative start time +
+// a short id fragment. The id fragment is required, not decorative - on this machine, several
+// same-day sessions in the same project all report git_branch "HEAD" (no real branch checked
+// out), so project+branch+relative-time alone can render multiple options with identical text
+// and no way to tell them apart in the picker.
+function formatSessionLabel(s: RecentSession): string {
+  const branch = s.git_branch && s.git_branch !== "HEAD" ? s.git_branch : null;
+  const branchPart = branch ? ` · ${branch.length > 22 ? `${branch.slice(0, 22)}…` : branch}` : "";
+  const lastActivity = s.ended_at ?? s.started_at;
+  // Liveness comes straight from the server (SESSION_LIVE_WINDOW_MS/isSessionLive in
+  // server/index.ts) so this label always agrees with the reconciliation sweep's own notion of
+  // "still running" instead of maintaining a separate client-side window.
+  const activity = s.live ? "● live" : `active ${formatRelativeStart(lastActivity)}`;
+  const task = s.first_message ? ` · ${s.first_message.length > 32 ? `${s.first_message.slice(0, 32)}…` : s.first_message}` : "";
+  return `${activity} · ${s.project}${branchPart}${task} · ${s.id.slice(0, 8)}`;
+}
+
 function groupByStatus(cards: Card[]) {
   const m: Record<CardStatus, Card[]> = {
     "Inbox": [],
@@ -164,6 +227,9 @@ function groupByStatus(cards: Card[]) {
 
 export default function App() {
   const [cards, setCards] = useState<Card[]>([]);
+  // True once the first GET /api/cards response has landed - distinguishes "no cards fetched yet"
+  // from "fetched successfully and the board is empty" for the stale-source-filter check below.
+  const [cardsLoaded, setCardsLoaded] = useState(false);
   const [selected, setSelected] = useState<Card | null>(null);
   const [logs, setLogs] = useState<Array<{ id: number; created_at: number; kind: string; message: string }>>([]);
   const [newTitle, setNewTitle] = useState("");
@@ -206,6 +272,32 @@ export default function App() {
   const [harnessMsg, setHarnessMsg] = useState<string | null>(null);
   const [queueStatus, setQueueStatus] = useState<QueueStatusResponse | null>(null);
 
+  // Session filter (design doc section 6) - list of recent agentsview sessions for the picker,
+  // and the currently-selected one ("" = unfiltered/"All sessions").
+  const [sessions, setSessions] = useState<RecentSession[]>([]);
+  const [selectedSessionId, setSelectedSessionId] = useState<string>("");
+
+  // Source filter - "" = "All sources". Restored from localStorage on mount so the picked source
+  // survives a page reload; wrapped in try/catch since localStorage can throw (private browsing,
+  // disabled storage, quota) and losing the saved choice is not worth crashing the board over.
+  const [sourceFilter, setSourceFilter] = useState<string>(() => {
+    try {
+      return localStorage.getItem(SOURCE_FILTER_STORAGE_KEY) ?? "";
+    } catch {
+      return "";
+    }
+  });
+
+  function selectSourceFilter(source: string) {
+    setSourceFilter(source);
+    try {
+      if (source) localStorage.setItem(SOURCE_FILTER_STORAGE_KEY, source);
+      else localStorage.removeItem(SOURCE_FILTER_STORAGE_KEY);
+    } catch {
+      // ignore storage errors - the in-memory filter still applies for this session
+    }
+  }
+
   const [oauthModels, setOauthModels] = useState<OAuthModelMap>({});
 
   const [newRole, setNewRole] = useState<Role | "">("");
@@ -215,11 +307,24 @@ export default function App() {
   async function refresh() {
     const cs = await listCards();
     setCards(cs);
+    setCardsLoaded(true);
     getQueueStatus().then(setQueueStatus).catch(() => {});
     if (selected) {
       const next = cs.find((c) => c.id === selected.id) ?? null;
       setSelected(next);
       if (next) setLogs(await getLogs(next.id));
+    }
+  }
+
+  // Session list for the filter picker - a much coarser cadence than the 1.2s card poll is fine
+  // here (design doc section 6: "once per minute or once per mount, it doesn't need 4s
+  // freshness"). Best-effort: agentsview being offline just leaves the previous list in place.
+  async function loadSessions() {
+    try {
+      const s = await getRecentSessions();
+      setSessions(s);
+    } catch {
+      // keep previous state on error
     }
   }
 
@@ -396,6 +501,31 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Stale source-filter reset: the persisted clawKanban.sourceFilter value is restored from
+  // localStorage before any card has ever loaded (see the sourceFilter useState above), so it can
+  // point at a source that no longer exists on this board (renamed sync source, cleared DB, etc).
+  // Validate it exactly once, right after the FIRST successful card load - never before cards have
+  // loaded (an empty `cards` array pre-load must not be mistaken for "no card has this source").
+  const sourceFilterValidatedRef = useRef(false);
+  useEffect(() => {
+    if (!cardsLoaded || sourceFilterValidatedRef.current) return;
+    sourceFilterValidatedRef.current = true;
+    if (sourceFilter && !cards.some((c) => c.source === sourceFilter)) {
+      setSourceFilter("");
+      try {
+        localStorage.removeItem(SOURCE_FILTER_STORAGE_KEY);
+      } catch {
+        // ignore storage errors - the in-memory filter reset still applies for this session
+      }
+    }
+  }, [cardsLoaded, cards, sourceFilter]);
+
+  useEffect(() => {
+    loadSessions().catch(() => {});
+    const t = setInterval(() => loadSessions().catch(() => {}), 60_000);
+    return () => clearInterval(t);
+  }, []);
+
   useEffect(() => {
     const u = new URL(window.location.href);
     const hasSettingsFlag = u.searchParams.get("settings") === "1";
@@ -479,8 +609,45 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionOpen, selected?.id, selected?.status]);
 
-  const columns = useMemo(() => groupByStatus(cards), [cards]);
-  const totalActive = (columns["In Progress"]?.length ?? 0) + (columns["Review/Test"]?.length ?? 0);
+  // Session filter (design doc section 6): a card is visible when its project_path matches the
+  // selected session's cwd (exact match, mirroring GET /api/cards?project_path='s semantics), OR
+  // the card is currently claimed by that session regardless of project_path. Applies across ALL
+  // columns, including Inbox/Planned - this is the "what should I work on next in this session"
+  // view, not just a filter on in-progress-ish cards.
+  const selectedSession = useMemo(
+    () => sessions.find((s) => s.id === selectedSessionId) ?? null,
+    [sessions, selectedSessionId]
+  );
+
+  // Distinct card.source values present in the full (unfiltered) card set, with counts, for the
+  // Source filter picker - e.g. "claude-consolidation (5)". Sorted alphabetically so the option
+  // order doesn't jump around as cards sync in.
+  const sourceCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const c of cards) counts.set(c.source, (counts.get(c.source) ?? 0) + 1);
+    return [...counts.entries()].sort((a, b) => a[0].localeCompare(b[0]));
+  }, [cards]);
+
+  // Source filter: client-side, exact match on card.source. Applies across ALL columns, same as
+  // the session filter above, and stacks with it (a card must pass both to be visible).
+  const visibleCards = useMemo(() => {
+    let result = cards;
+    if (selectedSession) {
+      result = result.filter(
+        (c) => c.project_path === selectedSession.cwd || c.claimed_session_id === selectedSession.id
+      );
+    }
+    if (sourceFilter) {
+      result = result.filter((c) => c.source === sourceFilter);
+    }
+    return result;
+  }, [cards, selectedSession, sourceFilter]);
+
+  // WIP dial/limit reflects real global concurrency regardless of the session filter, so it's
+  // derived from the unfiltered card set - only the rendered columns below use the filtered one.
+  const allColumns = useMemo(() => groupByStatus(cards), [cards]);
+  const columns = useMemo(() => groupByStatus(visibleCards), [visibleCards]);
+  const totalActive = (allColumns["In Progress"]?.length ?? 0) + (allColumns["Review/Test"]?.length ?? 0);
   const wipMax = queueStatus?.maxConcurrentTasks ?? 2;
   const wipAtLimit = totalActive >= wipMax;
   const wipPctDeg = Math.max(0, Math.min(1, totalActive / Math.max(1, wipMax))) * 360;
@@ -528,6 +695,34 @@ export default function App() {
           >
             {[1, 2, 3, 4, 5, 8].map((n) => (
               <option key={n} value={n}>Max {n}</option>
+            ))}
+          </select>
+        </div>
+
+        <div className="railGroup">
+          <span className="dialLabel">Session filter</span>
+          <select
+            className="dialSelect"
+            value={selectedSessionId}
+            onChange={(e) => setSelectedSessionId(e.target.value)}
+            title="Show only cards matching this session's project path, or claimed by it"
+          >
+            <option value="">— All sessions —</option>
+            {sessions.map((s) => (
+              <option key={s.id} value={s.id}>{formatSessionLabel(s)}</option>
+            ))}
+          </select>
+
+          <span className="dialLabel">Source filter</span>
+          <select
+            className="dialSelect"
+            value={sourceFilter}
+            onChange={(e) => selectSourceFilter(e.target.value)}
+            title="Show only cards synced from this source"
+          >
+            <option value="">All sources</option>
+            {sourceCounts.map(([source, count]) => (
+              <option key={source} value={source}>{`${source} (${count})`}</option>
             ))}
           </select>
         </div>
@@ -698,6 +893,12 @@ export default function App() {
         >+ Add</button>
       </section>
 
+      {visibleCards.length === 0 && cards.length > 0 && (selectedSessionId || sourceFilter) && (
+        <div className="filterEmpty" role="status">
+          No cards match the current session/source filter.
+        </div>
+      )}
+
       <main className={`board ${selected ? "drawerOpen" : ""}`}>
         {STATUSES.map((s) => (
           <div key={s} className="col">
@@ -743,6 +944,11 @@ export default function App() {
                           {formatCompactTokenCount(c.totalInputTokens)} in / {formatCompactTokenCount(c.totalOutputTokens)} out
                         </span>
                       )}
+                    </div>
+                  )}
+                  {c.session && (
+                    <div className="cardSessionOverlay" title="Live agentsview session activity">
+                      {cardSessionSummary(c.session)}
                     </div>
                   )}
                   <div className="cardActions" onClick={(e) => e.stopPropagation()}>

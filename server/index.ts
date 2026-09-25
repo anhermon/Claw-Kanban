@@ -648,6 +648,19 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_oauth_credentials_provider ON oauth_creden
 // Migration: add project_path column (safe to re-run; silently ignored if column exists)
 try { db.exec(`ALTER TABLE cards ADD COLUMN project_path TEXT`); } catch { /* column already exists */ }
 
+// Migration: add backlog-triage/session-control columns to cards (see design doc
+// docs/superpowers/specs/2026-09-16-backlog-triage-and-session-control-design.md)
+for (const columnDdl of [
+  "ALTER TABLE cards ADD COLUMN jira_status TEXT",
+  "ALTER TABLE cards ADD COLUMN harness_phase TEXT",
+  "ALTER TABLE cards ADD COLUMN last_seen_at INTEGER",
+  "ALTER TABLE cards ADD COLUMN claimed_session_id TEXT",
+  "ALTER TABLE cards ADD COLUMN claimed_by TEXT",
+  "ALTER TABLE cards ADD COLUMN claim_expires_at INTEGER",
+]) {
+  try { db.exec(columnDdl); } catch { /* column already exists */ }
+}
+
 // Migration: add per-run duration/model/token/cost columns to card_runs (safe to re-run;
 // silently ignored if a column already exists). Populated at run completion by
 // recordRunCompletion() below, so per-stage duration and token/cost stats survive status
@@ -2347,12 +2360,232 @@ function attachRunStats<T extends { id: string }>(rows: T[]): T[] {
   return rows;
 }
 
+// --- Agentsview passive correlation (design doc section 4: "Passive correlation") ---
+// Best-effort, read-only overlay showing live session activity on top of board cards. Refreshed
+// on server/queue-dispatcher.ts's existing 4s tick (see refreshAgentSessionCache below and its
+// wiring via startQueueWorker's onTick param) - never a second interval, per the design doc.
+
+const AGENTSVIEW_SESSIONS_URL = "http://127.0.0.1:50030/api/v1/sessions";
+const AGENTSVIEW_FETCH_TIMEOUT_MS = 2_000;
+
+// Minimal local shape of an agentsview session record - only the fields this overlay (and the
+// /api/sessions/recent picker below) use. The real response may include more fields; they're
+// ignored.
+interface AgentSessionRecord {
+  id: string;
+  project: string;
+  cwd: string;
+  first_message: string;
+  started_at: string;
+  ended_at: string | null;
+  message_count: number;
+  total_output_tokens: number;
+  health_score: number;
+  git_branch: string;
+  // Derived once per refresh (not part of the agentsview API shape) so attachSessionOverlay's
+  // fuzzy match doesn't re-lowercase up to 200 sessions' worth of strings per card on every
+  // /api/cards poll.
+  _gitBranchLower: string;
+  _firstMessageLower: string;
+}
+
+let agentSessionCache: AgentSessionRecord[] = [];
+
+// Statuses the design doc scopes correlation to - Done/Stopped cards are left untouched.
+const SESSION_OVERLAY_STATUSES = new Set(["Inbox", "Planned", "In Progress", "Review/Test"]);
+
+// Refetches agentsview's live session list into agentSessionCache. This is a best-effort
+// enhancement, not a dependency the board requires to function (design doc section 4) - on ANY
+// failure (network error, non-200, malformed JSON, timeout) it no-ops: keeps the last-known-good
+// cache rather than clearing it, never throws, and never logs above debug (agentsview being
+// offline is expected/normal, not a warning-worthy condition).
+async function refreshAgentSessionCache(): Promise<void> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), AGENTSVIEW_FETCH_TIMEOUT_MS);
+  try {
+    const resp = await fetch(AGENTSVIEW_SESSIONS_URL, { signal: controller.signal });
+    if (!resp.ok) throw new Error(`agentsview responded ${resp.status}`);
+    const data = (await resp.json()) as { sessions?: Omit<AgentSessionRecord, "_gitBranchLower" | "_firstMessageLower">[] };
+    if (!Array.isArray(data.sessions)) throw new Error("agentsview response missing sessions array");
+    agentSessionCache = data.sessions.map((s) => ({
+      ...s,
+      _gitBranchLower: (s.git_branch ?? "").toLowerCase(),
+      _firstMessageLower: (s.first_message ?? "").toLowerCase(),
+    }));
+  } catch (e: unknown) {
+    console.debug(`[Claw-Kanban] agentsview session refresh skipped: ${e instanceof Error ? e.message : String(e)}`);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// Liveness window (design doc §5): agentsview always sets ended_at to the session's last-activity
+// time - including for sessions that are still actively running - so ended_at == null is never a
+// usable "still running" signal (0 of 200 real sessions observed had it null, live ones included).
+// A session is instead considered live when its last activity (ended_at, falling back to
+// started_at for a session with no activity yet) is within this window of `now`.
+const SESSION_LIVE_WINDOW_MS = 20 * 60 * 1000;
+
+function isSessionLive(s: { ended_at: string | null; started_at: string }, now: number): boolean {
+  const lastActivityMs = Date.parse(s.ended_at ?? s.started_at);
+  return now - lastActivityMs < SESSION_LIVE_WINDOW_MS;
+}
+
+// Among several sessions whose git_branch/first_message all fuzzy-match the same ticket key,
+// prefers one that's still live (see isSessionLive above) over any non-live one, and otherwise the
+// most recently started - so a card with both an old finished session and a live one from the same
+// ticket shows the live one, not whichever happened to sort first in agentsview's response.
+function pickBestSessionMatch(candidates: AgentSessionRecord[], now: number): AgentSessionRecord | undefined {
+  if (candidates.length === 0) return undefined;
+  const live = candidates.find((s) => isSessionLive(s, now));
+  if (live) return live;
+  return candidates.reduce((best, s) => (Date.parse(s.started_at) > Date.parse(best.started_at) ? s : best));
+}
+
+// Overlay object shape attached to a matched card - see attachSessionOverlay below.
+interface SessionOverlay {
+  message_count: number;
+  total_output_tokens: number;
+  health_score: number;
+  elapsed_ms: number;
+}
+
+// Minimal local shape of a cards row - only the fields attachSessionOverlay reads. The real row
+// (SELECT c.* ...) has many more columns; they're passed through untouched.
+type CardRow = {
+  id: string;
+  status: string;
+  title: string;
+  claimed_session_id?: string | null;
+};
+
+type CardSessionOverlayRow = CardRow & { session?: SessionOverlay };
+
+// Attaches a read-only `session` overlay (live message/token counts, health score, elapsed time)
+// to cards that correlate with a currently-known agentsview session. Not persisted - recomputed
+// on every request from agentSessionCache. Mirrors attachRunStats()'s convention just above: the
+// field is left absent (not null) on cards with no match, camelCase, no underscore prefix.
+function attachSessionOverlay(cards: CardRow[]): CardSessionOverlayRow[] {
+  if (cards.length === 0 || agentSessionCache.length === 0) return cards;
+
+  const now = Date.now();
+  for (const card of cards as CardSessionOverlayRow[]) {
+    if (!SESSION_OVERLAY_STATUSES.has(card.status)) continue;
+
+    let session: AgentSessionRecord | undefined;
+    if (card.claimed_session_id != null) {
+      // Explicit claim always wins over fuzzy matching (design doc section 4).
+      session = agentSessionCache.find((s) => s.id === card.claimed_session_id);
+    } else {
+      const ticketKey = extractTicketKey(card.title);
+      if (ticketKey) {
+        const needle = ticketKey.toLowerCase();
+        const candidates = agentSessionCache.filter(
+          (s) => s._gitBranchLower.includes(needle) || s._firstMessageLower.includes(needle),
+        );
+        session = pickBestSessionMatch(candidates, now);
+      }
+    }
+
+    if (!session) continue;
+
+    const startedMs = Date.parse(session.started_at);
+    const endedMs = session.ended_at ? Date.parse(session.ended_at) : now;
+    card.session = {
+      message_count: session.message_count,
+      total_output_tokens: session.total_output_tokens,
+      health_score: session.health_score,
+      elapsed_ms: Math.max(0, endedMs - startedMs),
+    };
+  }
+
+  return cards;
+}
+
+// --- Reconciliation sweep (design doc section 5: "Reconciliation sweep") ---
+// Catches an external claim whose lease has expired with no live agentsview session behind it -
+// e.g. the holder crashed or lost network before calling /release. Runs on the same 4s tick as
+// refreshAgentSessionCache (wired together below via startQueueWorker's onTick param), always
+// AFTER that refresh completes, so the liveness check below always sees this tick's freshest
+// agentSessionCache data, never a stale read from the previous tick.
+//
+// Scoped to claimed_by='external' only - board-spawned runs (claimed_by='board') are reconciled
+// by the separate, unrelated reapOrphanedActiveCards() pid-liveness sweep further down in this
+// file (a pre-existing mechanism for a different failure mode - a dead OS process behind a
+// board-spawned run - that predates claims entirely and this function must not touch).
+function reconcileExpiredExternalClaims(): void {
+  const now = nowMs();
+  const expiredClaims = db.prepare(
+    `SELECT id, claimed_session_id FROM cards WHERE claimed_by = 'external' AND claim_expires_at IS NOT NULL AND claim_expires_at < ?`
+  ).all(now) as { id: string; claimed_session_id: string | null }[];
+
+  for (const claim of expiredClaims) {
+    const liveSession = agentSessionCache.find(
+      (s) => s.id === claim.claimed_session_id && isSessionLive(s, now),
+    );
+    // Session behind the lease is still alive despite a missed heartbeat - leave the card (and
+    // its claim fields) completely alone. The external session owns calling /heartbeat itself;
+    // this sweep's only job is to not prematurely release a claim that's evidently still live.
+    if (liveSession) continue;
+
+    db.prepare(
+      "UPDATE cards SET status = 'Planned', claimed_session_id = NULL, claimed_by = NULL, claim_expires_at = NULL, updated_at = ? WHERE id = ?"
+    ).run(now, claim.id);
+    appendCardLog(claim.id, "system", "claim expired, released automatically");
+  }
+}
+
+// Window for the session-filter picker (design doc section 6) - sessions with no activity in this
+// window are not offered as filter options. Activity is ended_at (agentsview's last-message time),
+// falling back to started_at, so a long-running session started days ago still shows while live.
+const RECENT_SESSIONS_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+// Trimmed list of recent sessions for the board's session-filter picker (design doc section 6).
+// Pure read off agentSessionCache - refreshAgentSessionCache() above already refetches that cache
+// on the queue worker's existing 4s tick, so this endpoint never fetches agentsview itself and
+// needs no interval of its own. Deliberately excludes the internal _gitBranchLower/
+// _firstMessageLower derived fields and the token/message/health fields (those are for the card
+// overlay, not the picker).
+app.get("/api/sessions/recent", (_req, res) => {
+  const now = Date.now();
+  const cutoff = now - RECENT_SESSIONS_WINDOW_MS;
+  const sessions = agentSessionCache
+    .filter((s) => Date.parse(s.ended_at ?? s.started_at) >= cutoff)
+    .map((s) => ({
+      id: s.id,
+      project: s.project,
+      cwd: s.cwd,
+      git_branch: s.git_branch,
+      started_at: s.started_at,
+      ended_at: s.ended_at,
+      // Computed with the same isSessionLive helper used server-side for the sweep/overlay, so the
+      // client's "● live" label always agrees with what the reconciliation sweep considers live.
+      live: isSessionLive(s, now),
+      // Short task hint so the picker can tell sessions in the same project apart.
+      first_message: (s.first_message ?? "").replace(/\s+/g, " ").trim().slice(0, 60),
+    }))
+    .sort((a, b) => Date.parse(b.ended_at ?? b.started_at) - Date.parse(a.ended_at ?? a.started_at));
+  res.json({ sessions });
+});
+
 app.get("/api/cards", (req, res) => {
   const status = req.query.status ? CardStatus.parse(req.query.status) : undefined;
-  const rows = status
-    ? db.prepare(`${CARDS_WITH_RUN_START_SQL} WHERE c.status = ? ORDER BY c.updated_at DESC`).all(status)
-    : db.prepare(`${CARDS_WITH_RUN_START_SQL} ORDER BY c.updated_at DESC`).all();
-  res.json({ cards: attachRunStats(rows as { id: string }[]) });
+  const projectPath = firstQueryValue(req.query.project_path);
+
+  const conditions: string[] = [];
+  const params: string[] = [];
+  if (status) {
+    conditions.push("c.status = ?");
+    params.push(status);
+  }
+  if (projectPath) {
+    conditions.push("c.project_path = ?");
+    params.push(projectPath);
+  }
+  const where = conditions.length ? `WHERE ${conditions.join(" AND ")}` : "";
+
+  const rows = db.prepare(`${CARDS_WITH_RUN_START_SQL} ${where} ORDER BY c.updated_at DESC`).all(...params);
+  res.json({ cards: attachSessionOverlay(attachRunStats(rows as CardRow[])) });
 });
 
 app.get("/api/cards/search", (req, res) => {
@@ -2921,7 +3154,9 @@ function handleReviewComplete(cardId: string, exitCode: number) {
     const passed = reviewLog.includes("REVIEW_PASSED") || reviewLog.toLowerCase().includes("looks good");
 
     if (passed) {
-      db.prepare("UPDATE cards SET updated_at = ?, status = ? WHERE id = ?")
+      // Terminal state: clear any board-held claim so it doesn't linger on a Done card forever
+      // (§4/§5 of the design read these fields for correlation/expiry-sweep logic later).
+      db.prepare("UPDATE cards SET updated_at = ?, status = ?, claimed_session_id = NULL, claimed_by = NULL, claim_expires_at = NULL WHERE id = ?")
         .run(nowMs(), "Done", cardId);
       queueWake({ key: `done:${cardId}`, text: `Kanban: Review/Test -> Done - ${card?.title ?? cardId}`, debounceMs: 5000 });
     } else {
@@ -3053,9 +3288,13 @@ async function executeCardRun(id: string): Promise<{ ok: boolean; pid?: number |
     ).run(id, runCreatedAt, agent, fakePid, "running", logPath, projectPath);
     const runId = runInsert.lastInsertRowid;
 
+    // Board-spawned run: claim the card for the board itself (claimed_by='board') so the claim
+    // fields are the single source of truth for "who owns this card right now" instead of an
+    // implicit "status says In Progress so it must be running" assumption. No claim_expires_at -
+    // board-held claims are tied to process lifecycle, not a lease timer.
     db.prepare(
-      "UPDATE cards SET updated_at = ?, status = ? WHERE id = ?"
-    ).run(nowMs(), "In Progress", id);
+      "UPDATE cards SET updated_at = ?, status = ?, claimed_by = ?, claimed_session_id = ?, claim_expires_at = ? WHERE id = ?"
+    ).run(nowMs(), "In Progress", "board", `board_${id}_${runCreatedAt}`, null, id);
 
     launchHttpAgent(id, agent, prompt, projectPath, logPath, controller, fakePid, runId, runCreatedAt);
     return { ok: true, pid: fakePid, logPath, cwd: projectPath };
@@ -3074,9 +3313,10 @@ async function executeCardRun(id: string): Promise<{ ok: boolean; pid?: number |
   ).run(id, runCreatedAt, agent, child.pid ?? null, "running", logPath, projectPath);
   runId = runInsert.lastInsertRowid;
 
+  // Board-spawned run: same claim semantics as the HTTP-agent branch above.
   db.prepare(
-    "UPDATE cards SET updated_at = ?, status = ? WHERE id = ?"
-  ).run(nowMs(), "In Progress", id);
+    "UPDATE cards SET updated_at = ?, status = ?, claimed_by = ?, claimed_session_id = ?, claim_expires_at = ? WHERE id = ?"
+  ).run(nowMs(), "In Progress", "board", `board_${id}_${runCreatedAt}`, null, id);
 
   return { ok: true, pid: child.pid ?? null, logPath, cwd: projectPath };
 }
@@ -3173,6 +3413,112 @@ app.post("/api/cards/:id/stop", (req, res) => {
   db.prepare("UPDATE cards SET updated_at = ?, status = ? WHERE id = ?").run(stoppedAt, "Stopped", id);
 
   res.json({ ok: true, stopped: true, pid });
+});
+
+const claimCardSchema = z.object({
+  session_id: z.string().min(1),
+});
+
+// Claim a card for an external (non-board) session. Idempotent for the same session_id
+// re-claiming its own card; exclusive against any other session holding a still-valid claim.
+app.post("/api/cards/:id/claim", (req, res) => {
+  const id = String(req.params.id);
+  const parsed = claimCardSchema.safeParse(req.body ?? {});
+  if (!parsed.success) return res.status(400).json({ error: "invalid_body" });
+  const { session_id } = parsed.data;
+
+  const card = db.prepare("SELECT * FROM cards WHERE id = ?").get(id) as
+    | { claimed_session_id: string | null; claim_expires_at: number | null; status: string }
+    | undefined;
+  if (!card) return res.status(404).json({ error: "not_found" });
+
+  const now = nowMs();
+  const claimStillValid = card.claimed_session_id != null && (card.claim_expires_at == null || card.claim_expires_at > now);
+  const isSameSessionReclaim = claimStillValid && card.claimed_session_id === session_id;
+
+  // Same session_id re-claiming its own card is idempotent regardless of status (its own prior
+  // claim already flipped status to "In Progress", so the Inbox/Planned precondition below only
+  // applies to a first-time claim or a claim by a different session).
+  if (!isSameSessionReclaim) {
+    const notClaimableStatus = card.status !== "Inbox" && card.status !== "Planned";
+    const claimedByOther = claimStillValid && card.claimed_session_id !== session_id;
+    if (notClaimableStatus || claimedByOther) {
+      return res.status(409).json({ error: "not_claimable" });
+    }
+  }
+
+  const claimExpiresAt = now + 15 * 60 * 1000;
+  db.prepare(
+    "UPDATE cards SET claimed_by = ?, claimed_session_id = ?, claim_expires_at = ?, status = ?, updated_at = ? WHERE id = ?"
+  ).run("external", session_id, claimExpiresAt, "In Progress", now, id);
+
+  appendCardLog(id, "system", `Claimed by external session ${session_id}`);
+
+  const updated = db.prepare("SELECT * FROM cards WHERE id = ?").get(id);
+  res.json({ ok: true, card: updated });
+});
+
+const heartbeatCardSchema = z.object({
+  session_id: z.string().min(1),
+});
+
+// Extend an external session's lease on a card it already claimed.
+app.post("/api/cards/:id/heartbeat", (req, res) => {
+  const id = String(req.params.id);
+  const parsed = heartbeatCardSchema.safeParse(req.body ?? {});
+  if (!parsed.success) return res.status(400).json({ error: "invalid_body" });
+  const { session_id } = parsed.data;
+
+  const card = db.prepare("SELECT * FROM cards WHERE id = ?").get(id) as { claimed_session_id: string | null } | undefined;
+  if (!card) return res.status(404).json({ error: "not_found" });
+
+  if (card.claimed_session_id !== session_id) {
+    return res.status(409).json({ error: "not_claimed_by_you" });
+  }
+
+  const now = nowMs();
+  const claimExpiresAt = now + 15 * 60 * 1000;
+  db.prepare("UPDATE cards SET claim_expires_at = ?, updated_at = ? WHERE id = ?").run(claimExpiresAt, now, id);
+
+  res.json({ ok: true, claim_expires_at: claimExpiresAt });
+});
+
+const releaseCardSchema = z.object({
+  session_id: z.string().min(1),
+  outcome: z.enum(["done", "blocked", "abandon"]),
+});
+
+const RELEASE_OUTCOME_STATUS: Record<"done" | "blocked" | "abandon", string> = {
+  done: "Review/Test",
+  blocked: "Stopped",
+  abandon: "Planned",
+};
+
+// Release an external session's claim on a card. Every outcome clears the claim fields - even
+// "blocked" releases the lease, it just also parks the card instead of leaving it held.
+app.post("/api/cards/:id/release", (req, res) => {
+  const id = String(req.params.id);
+  const parsed = releaseCardSchema.safeParse(req.body ?? {});
+  if (!parsed.success) return res.status(400).json({ error: "invalid_body" });
+  const { session_id, outcome } = parsed.data;
+
+  const card = db.prepare("SELECT * FROM cards WHERE id = ?").get(id) as { claimed_session_id: string | null } | undefined;
+  if (!card) return res.status(404).json({ error: "not_found" });
+
+  if (card.claimed_session_id !== session_id) {
+    return res.status(409).json({ error: "not_claimed_by_you" });
+  }
+
+  const now = nowMs();
+  const status = RELEASE_OUTCOME_STATUS[outcome];
+  db.prepare(
+    "UPDATE cards SET status = ?, claimed_session_id = NULL, claimed_by = NULL, claim_expires_at = NULL, updated_at = ? WHERE id = ?"
+  ).run(status, now, id);
+
+  appendCardLog(id, "system", `Released by external session ${session_id}: ${outcome}`);
+
+  const updated = db.prepare("SELECT * FROM cards WHERE id = ?").get(id);
+  res.json({ ok: true, card: updated });
 });
 
 // Callback endpoint for CLI process completion (also usable by external tools)
@@ -3413,7 +3759,16 @@ app.listen(PORT, HOST, () => {
   // while every restart's blind reset spawned yet another one via auto-dispatch). Use the
   // pid-liveness-aware reconciler instead - it only reverts cards whose process is confirmed dead.
   reapOrphanedActiveCards();
-  startQueueWorker(db);
+  // Second param piggybacks the agentsview session-correlation sweep AND the expired-external-
+  // claim reconciliation sweep onto this same 4s tick (see attachSessionOverlay/
+  // refreshAgentSessionCache/reconcileExpiredExternalClaims above) - independent of autoDispatch,
+  // since visualization must work even with dispatch disabled (its default). Order matters:
+  // refresh the session cache first, then reconcile against it, so reconciliation always checks
+  // this tick's freshest liveness data rather than what the previous tick left behind.
+  startQueueWorker(db, async () => {
+    await refreshAgentSessionCache();
+    reconcileExpiredExternalClaims();
+  });
   // Same pid-liveness check on a periodic interval, so a run that dies mid-uptime (killed some
   // other way, crashed, etc.) gets caught without waiting for the next server restart.
   setInterval(reapOrphanedActiveCards, 30_000);
