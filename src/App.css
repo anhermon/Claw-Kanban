@@ -352,6 +352,7 @@ body {
    =================================================================== */
 .card {
   position: relative;
+  flex-shrink: 0;
   padding: 10px 11px;
   background: linear-gradient(180deg, rgba(255, 255, 255, 0.026), rgba(255, 255, 255, 0) 45%), var(--col-bg);
   border: 1px solid var(--line);

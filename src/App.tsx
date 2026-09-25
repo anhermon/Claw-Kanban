@@ -647,7 +647,7 @@ export default function App() {
   // derived from the unfiltered card set - only the rendered columns below use the filtered one.
   const allColumns = useMemo(() => groupByStatus(cards), [cards]);
   const columns = useMemo(() => groupByStatus(visibleCards), [visibleCards]);
-  const totalActive = (allColumns["In Progress"]?.length ?? 0) + (allColumns["Review/Test"]?.length ?? 0);
+  const totalActive = queueStatus?.activeCount ?? ((allColumns["In Progress"]?.length ?? 0) + (allColumns["Review/Test"]?.length ?? 0));
   const wipMax = queueStatus?.maxConcurrentTasks ?? 2;
   const wipAtLimit = totalActive >= wipMax;
   const wipPctDeg = Math.max(0, Math.min(1, totalActive / Math.max(1, wipMax))) * 360;
@@ -912,8 +912,8 @@ export default function App() {
               {columns[s].map((c) => (
                 <div key={c.id} className={"card"
                        + (selected?.id === c.id ? " selected" : "")
-                       + (c.status === "In Progress" ? " agent-active" : "")
-                       + (c.status === "Review/Test" ? " agent-reviewing" : "")}
+                       + (c.status === "In Progress" && c.session ? " agent-active" : "")
+                       + (c.status === "Review/Test" && c.session ? " agent-reviewing" : "")}
                      onClick={() => openCard(c)}>
                   <div className="cardTitle">
                     {c.source === "agent-harness:jira" && <span className="cardEpicBadge">EPIC</span>}
