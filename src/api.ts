@@ -46,6 +46,10 @@ export interface Card {
   task_type?: TaskType;
   project_path?: string | null;
   run_started_at?: number | null;
+  // Owning session id when this card is externally claimed (design doc section 3) - present only
+  // while a claim is active. Used by the session filter (section 6) to match a card regardless
+  // of its project_path.
+  claimed_session_id?: string | null;
   // Aggregated run stats, derived server-side from ALL of the card's card_runs rows (split by
   // whether the run was a review run). Present only when the card has at least one run - see
   // attachRunStats() in server/index.ts. Absent/undefined means "never run", not "zero".
@@ -55,6 +59,15 @@ export interface Card {
   modelsUsed?: string[];
   totalInputTokens?: number | null;
   totalOutputTokens?: number | null;
+  // Read-only live-session overlay (design doc §4 "Passive correlation"), attached server-side in
+  // GET /api/cards when the card correlates with a currently-known agentsview session. Not
+  // persisted - absent means no matching session, not "zero activity".
+  session?: {
+    message_count: number;
+    total_output_tokens: number;
+    health_score: number;
+    elapsed_ms: number;
+  };
 }
 
 export interface CardLog {
@@ -470,6 +483,29 @@ export async function dispatchNextTask(): Promise<{ dispatched: boolean; card?: 
   const r = await fetch(`${base}/api/queue/dispatch-next`, { method: "POST" });
   if (!r.ok) throw new Error(`dispatchNextTask failed: ${r.status}`);
   return (await r.json()) as { dispatched: boolean; card?: any; reason?: string };
+}
+
+// --- Session filter (design doc section 6) ---
+
+export interface RecentSession {
+  id: string;
+  project: string;
+  cwd: string;
+  git_branch: string;
+  started_at: string;
+  ended_at: string | null;
+  // Server-computed liveness (same SESSION_LIVE_WINDOW_MS/isSessionLive helper used for the
+  // reconciliation sweep) - the client renders the "● live" label straight off this field instead
+  // of maintaining its own window.
+  live: boolean;
+  first_message: string;
+}
+
+export async function getRecentSessions(): Promise<RecentSession[]> {
+  const r = await fetch(`${base}/api/sessions/recent`);
+  if (!r.ok) throw new Error(`getRecentSessions failed: ${r.status}`);
+  const j = await r.json();
+  return j.sessions as RecentSession[];
 }
 
 

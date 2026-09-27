@@ -114,13 +114,35 @@ export async function dispatchNextTask(db: DatabaseSync): Promise<{ dispatched: 
     };
   }
 
-  // Find next actionable card from Planned
+  // Find next actionable card from Planned.
+  // Excludes:
+  //  - cards sharing a project_path with a card already active (In Progress/Review-Test) —
+  //    prevents two agent runs from working the same repo concurrently. A NULL project_path
+  //    candidate is explicitly guarded to pass through (SQL NOT IN against NULL is otherwise
+  //    unknown/excluding, so this can't be left implicit).
+  //  - cards with a non-expired external claim (claimed_session_id set and claim_expires_at in
+  //    the future) — off-limits to this dispatcher even if status is technically Planned. A NULL
+  //    claim_expires_at on a claimed card is treated as not-yet-expiring-checkable and, since that
+  //    doesn't match the "non-expired" (claim_expires_at > now) definition, is not excluded here.
+  const now = Date.now();
   const nextCard = db.prepare(`
     SELECT * FROM cards
     WHERE status = 'Planned'
+      AND (
+        project_path IS NULL
+        OR project_path NOT IN (
+          SELECT project_path FROM cards
+          WHERE status IN ${ACTIVE_STATUSES} AND project_path IS NOT NULL
+        )
+      )
+      AND (
+        claimed_session_id IS NULL
+        OR claim_expires_at IS NULL
+        OR claim_expires_at <= ?
+      )
     ORDER BY priority DESC, updated_at ASC
     LIMIT 1
-  `).get() as any;
+  `).get(now) as any;
 
   if (!nextCard) {
     return { dispatched: false, reason: "No pending cards in Planned" };
@@ -140,12 +162,25 @@ export async function dispatchNextTask(db: DatabaseSync): Promise<{ dispatched: 
   return { dispatched: false, reason: "No execution callback registered" };
 }
 
-export function startQueueWorker(db: DatabaseSync): void {
+// `onTick` lets callers (server/index.ts) piggyback on this same 4s cadence for unrelated
+// per-tick work (e.g. the agentsview session-correlation sweep - see the design doc's
+// "reuse the existing dispatcher's 4s background loop cadence - no second interval"). It runs
+// unconditionally, before the autoDispatch check, in its own try/catch so a failure there can
+// never suppress the dispatch check in the same tick.
+export function startQueueWorker(db: DatabaseSync, onTick?: () => void | Promise<void>): void {
   // Initialize queue config
   getQueueConfig(db);
 
   // Background gradual dispatcher loop every 4 seconds
   setInterval(async () => {
+    if (onTick) {
+      try {
+        await onTick();
+      } catch (e) {
+        console.error("[Queue Dispatcher] onTick callback error:", e);
+      }
+    }
+
     try {
       const config = getQueueConfig(db);
       if (!config.autoDispatch) return;

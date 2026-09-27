@@ -29,9 +29,9 @@ function normalizePhaseToKanbanStatus(phaseOrStatus: string): "Inbox" | "Planned
     return "Stopped";
   }
   // To avoid flooding In-Progress with hundreds of past Jira/harness tickets,
-  // all active, in-progress, in-review, and backlog tickets land in Planned (Backlog)
-  // so they can be worked on gradually up to the max concurrent WIP limit.
-  return "Planned";
+  // everything else lands in Inbox first — Planned is now an explicit
+  // promotion step, not sync's default target.
+  return "Inbox";
 }
 
 function priorityToNumber(priStr?: string): number {
@@ -120,8 +120,8 @@ export function syncAgentHarness(db: DatabaseSync): HarnessSyncResult {
   const now = Date.now();
 
   const insertCardStmt = db.prepare(`
-    INSERT INTO cards (id, created_at, updated_at, source, source_message_id, source_author, source_chat, title, description, status, assignee, priority, role, task_type, project_path)
-    VALUES (@id, @created_at, @updated_at, @source, @source_message_id, @source_author, @source_chat, @title, @description, @status, @assignee, @priority, @role, @task_type, @project_path)
+    INSERT INTO cards (id, created_at, updated_at, source, source_message_id, source_author, source_chat, title, description, status, assignee, priority, role, task_type, project_path, jira_status, harness_phase, last_seen_at)
+    VALUES (@id, @created_at, @updated_at, @source, @source_message_id, @source_author, @source_chat, @title, @description, @status, @assignee, @priority, @role, @task_type, @project_path, @jira_status, @harness_phase, @last_seen_at)
   `);
 
   const updateCardStmt = db.prepare(`
@@ -132,7 +132,10 @@ export function syncAgentHarness(db: DatabaseSync): HarnessSyncResult {
         status = @status,
         priority = @priority,
         role = @role,
-        project_path = @project_path
+        project_path = @project_path,
+        jira_status = @jira_status,
+        harness_phase = @harness_phase,
+        last_seen_at = @last_seen_at
     WHERE id = @id
   `);
 
@@ -199,9 +202,12 @@ export function syncAgentHarness(db: DatabaseSync): HarnessSyncResult {
     const existing = db.prepare("SELECT * FROM cards WHERE source_message_id = ? LIMIT 1").get(key) as any;
 
     if (existing) {
-      // Don't overwrite In Progress if card is currently actively running locally
+      // Don't overwrite In Progress/Review/Test/Done/Planned if the card has
+      // already been promoted past sync's default (Inbox) — sync only ever
+      // downgrades into Inbox on first creation, never demotes an
+      // already-promoted card.
       const currentStatus = existing.status;
-      const targetStatus = (currentStatus === "In Progress" || currentStatus === "Review/Test" || currentStatus === "Done")
+      const targetStatus = (currentStatus === "In Progress" || currentStatus === "Review/Test" || currentStatus === "Done" || currentStatus === "Planned")
         ? currentStatus
         : status;
 
@@ -214,6 +220,9 @@ export function syncAgentHarness(db: DatabaseSync): HarnessSyncResult {
         priority,
         role,
         project_path: repoDir || existing.project_path,
+        jira_status: jira.status || null,
+        harness_phase: state.phase || null,
+        last_seen_at: now,
       });
       totalSynced++;
     } else {
@@ -234,6 +243,9 @@ export function syncAgentHarness(db: DatabaseSync): HarnessSyncResult {
         role,
         task_type: isInternal ? "modify" : "new",
         project_path: repoDir,
+        jira_status: jira.status || null,
+        harness_phase: state.phase || null,
+        last_seen_at: now,
       });
 
       db.prepare("INSERT INTO card_logs (card_id, created_at, kind, message) VALUES (?, ?, ?, ?)").run(
