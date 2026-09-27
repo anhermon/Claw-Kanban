@@ -28,10 +28,22 @@ function normalizePhaseToKanbanStatus(phaseOrStatus: string): "Inbox" | "Planned
   if (["blocked", "test-failure", "stopped"].includes(p)) {
     return "Stopped";
   }
-  // To avoid flooding In-Progress with hundreds of past Jira/harness tickets,
-  // everything else lands in Inbox first — Planned is now an explicit
-  // promotion step, not sync's default target.
+  if (["in-progress", "in progress", "in development", "branch-created"].includes(p)) {
+    return "In Progress";
+  }
+  if (["submitted", "in-review", "in review", "code review", "tested-pass"].includes(p)) {
+    return "Review/Test";
+  }
+  // Active harness phases land in their own column; backlog (planned, empty,
+  // unknown) stays in Inbox. Sync never demotes a card someone has already
+  // moved — the targetStatus logic below keeps In Progress/Review/Test/Done/Planned.
   return "Inbox";
+}
+
+export function harnessStatusFor(phase: string | null | undefined, jiraStatus: string | null | undefined): string {
+  return normalizePhaseToKanbanStatus(jiraStatus || "") === "Done"
+    ? "Done"
+    : normalizePhaseToKanbanStatus(phase || jiraStatus || "Planned");
 }
 
 function priorityToNumber(priStr?: string): number {
@@ -155,8 +167,7 @@ export function syncAgentHarness(db: DatabaseSync): HarnessSyncResult {
     const prefix = isInternal ? "[INTERNAL]" : "[EPIC]";
     const title = `${prefix} ${key}: ${summary}`;
 
-    const rawPhase = state.phase || jira.status || "Planned";
-    const status = normalizePhaseToKanbanStatus(rawPhase);
+    const status = harnessStatusFor(state.phase, jira.status);
     const priority = priorityToNumber(jira.priority || state.priority);
     const repoDir = state.repo_dir || null;
     const role = deriveRole(key, repoDir);

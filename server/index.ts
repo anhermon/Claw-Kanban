@@ -9,7 +9,7 @@ import { DatabaseSync } from "node:sqlite";
 import { z } from "zod";
 import { WebSocket } from "ws";
 import { fileURLToPath } from "node:url";
-import { syncAgentHarness, getHarnessSyncStatus, updateHarnessStateFile } from "./harness-sync.ts";
+import { syncAgentHarness, getHarnessSyncStatus, updateHarnessStateFile, harnessStatusFor } from "./harness-sync.ts";
 import { parseClaudeSessionLog } from "./session-parser.ts";
 import { checkBindSafety, createSecurityMiddleware, isLoopbackHost } from "./security.ts";
 import {
@@ -3081,10 +3081,15 @@ function isPidAlive(pid: number): boolean {
 // run dying mid-uptime (killed some other way, crashed, etc.) without waiting for the next restart.
 function reapOrphanedActiveCards(): void {
   const activeCards = db.prepare(
-    `SELECT id, status FROM cards WHERE status IN ('In Progress', 'Review/Test')`
-  ).all() as { id: string; status: string }[];
+    `SELECT id, status, harness_phase, jira_status FROM cards WHERE status IN ('In Progress', 'Review/Test')`
+  ).all() as { id: string; status: string; harness_phase: string | null; jira_status: string | null }[];
 
   for (const card of activeCards) {
+    // Status is owned by the harness/Jira sync when it agrees with the current
+    // status — don't revert a card the external source is still actively holding here.
+    const externalAgrees = Boolean(card.harness_phase || card.jira_status) &&
+      harnessStatusFor(card.harness_phase, card.jira_status) === card.status;
+
     const isReview = card.status === "Review/Test";
     const agentFilter = isReview ? "agent LIKE '%-review'" : "agent NOT LIKE '%-review'";
     const latestRun = db.prepare(
@@ -3103,9 +3108,11 @@ function reapOrphanedActiveCards(): void {
       // already recorded a real duration, so the pid-liveness check alone would never have caught
       // it since there was nothing "open" left to examine.
       const now = nowMs();
-      db.prepare("UPDATE cards SET status = 'Planned', updated_at = ? WHERE id = ?").run(now, card.id);
-      appendCardLog(card.id, "system", "Detected stale active status (latest run already settled, none in flight) — reverted to Planned");
-      appendSystemLog("system", `Stale active status (no in-flight run), reverted to Planned: ${card.id}`);
+      if (!externalAgrees) {
+        db.prepare("UPDATE cards SET status = 'Planned', updated_at = ? WHERE id = ?").run(now, card.id);
+        appendCardLog(card.id, "system", "Detected stale active status (latest run already settled, none in flight) — reverted to Planned");
+        appendSystemLog("system", `Stale active status (no in-flight run), reverted to Planned: ${card.id}`);
+      }
       activeProcesses.delete(card.id);
       activeProcesses.delete(`${card.id}:review`);
       continue;
@@ -3129,9 +3136,11 @@ function reapOrphanedActiveCards(): void {
     recordRunCompletion(latestRun.id, logPath, latestRun.created_at);
     finalizeOpenRunsForCard(card.id, now);
 
-    db.prepare("UPDATE cards SET status = 'Planned', updated_at = ? WHERE id = ?").run(now, card.id);
-    appendCardLog(card.id, "system", "Detected orphaned run (process no longer alive) — reverted to Planned");
-    appendSystemLog("system", `Orphaned run detected (pid ${pid ?? "unknown"} dead), reverted to Planned: ${card.id}`);
+    if (!externalAgrees) {
+      db.prepare("UPDATE cards SET status = 'Planned', updated_at = ? WHERE id = ?").run(now, card.id);
+      appendCardLog(card.id, "system", "Detected orphaned run (process no longer alive) — reverted to Planned");
+      appendSystemLog("system", `Orphaned run detected (pid ${pid ?? "unknown"} dead), reverted to Planned: ${card.id}`);
+    }
     activeProcesses.delete(card.id);
     activeProcesses.delete(`${card.id}:review`);
   }

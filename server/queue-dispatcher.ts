@@ -71,9 +71,19 @@ export function saveQueueConfig(db: DatabaseSync, config: Partial<QueueConfig>):
 // harness-sync flood incident: 22 epics stuck in Review/Test with zero real runs).
 const ACTIVE_STATUSES = "('In Progress', 'Review/Test')";
 
+// Harness/Jira sync also parks externally tracked cards in ACTIVE_STATUSES purely for board
+// visibility (see above) — those never had a local run and must not eat a WIP slot. A card only
+// counts as actually active here if it's not externally tracked at all, or it has a run still
+// open locally (no duration_ms yet), or it currently holds a live (unexpired) external claim.
+const ACTIVE_OWNED_CLAUSE = `(
+  (harness_phase IS NULL AND jira_status IS NULL)
+  OR EXISTS (SELECT 1 FROM card_runs WHERE card_runs.card_id = cards.id AND duration_ms IS NULL)
+  OR (claimed_session_id IS NOT NULL AND claim_expires_at > ?)
+)`;
+
 export function moveActiveToBacklog(db: DatabaseSync): { count: number } {
-  const activeRows = db.prepare(`SELECT id, title FROM cards WHERE status IN ${ACTIVE_STATUSES}`).all() as Array<{ id: string; title: string }>;
   const now = Date.now();
+  const activeRows = db.prepare(`SELECT id, title FROM cards WHERE status IN ${ACTIVE_STATUSES} AND ${ACTIVE_OWNED_CLAUSE}`).all(now) as Array<{ id: string; title: string }>;
 
   const updateStmt = db.prepare("UPDATE cards SET status = 'Planned', updated_at = ? WHERE id = ?");
   const logStmt = db.prepare("INSERT INTO card_logs (card_id, created_at, kind, message) VALUES (?, ?, 'system', 'Moved back to Planned (WIP limit reset)')");
@@ -89,7 +99,8 @@ export function moveActiveToBacklog(db: DatabaseSync): { count: number } {
 
 export function getQueueStatus(db: DatabaseSync): QueueStatus {
   const config = getQueueConfig(db);
-  const activeRows = db.prepare(`SELECT id FROM cards WHERE status IN ${ACTIVE_STATUSES}`).all() as Array<{ id: string }>;
+  const now = Date.now();
+  const activeRows = db.prepare(`SELECT id FROM cards WHERE status IN ${ACTIVE_STATUSES} AND ${ACTIVE_OWNED_CLAUSE}`).all(now) as Array<{ id: string }>;
   const plannedRow = db.prepare("SELECT count(*) as c FROM cards WHERE status = 'Planned'").get() as { c: number };
   const inboxRow = db.prepare("SELECT count(*) as c FROM cards WHERE status = 'Inbox'").get() as { c: number };
 
@@ -105,7 +116,8 @@ export function getQueueStatus(db: DatabaseSync): QueueStatus {
 
 export async function dispatchNextTask(db: DatabaseSync): Promise<{ dispatched: boolean; card?: any; reason?: string }> {
   const config = getQueueConfig(db);
-  const activeRows = db.prepare(`SELECT id FROM cards WHERE status IN ${ACTIVE_STATUSES}`).all() as Array<{ id: string }>;
+  const now = Date.now();
+  const activeRows = db.prepare(`SELECT id FROM cards WHERE status IN ${ACTIVE_STATUSES} AND ${ACTIVE_OWNED_CLAUSE}`).all(now) as Array<{ id: string }>;
 
   if (activeRows.length >= config.maxConcurrentTasks) {
     return {
@@ -124,7 +136,6 @@ export async function dispatchNextTask(db: DatabaseSync): Promise<{ dispatched: 
   //    the future) — off-limits to this dispatcher even if status is technically Planned. A NULL
   //    claim_expires_at on a claimed card is treated as not-yet-expiring-checkable and, since that
   //    doesn't match the "non-expired" (claim_expires_at > now) definition, is not excluded here.
-  const now = Date.now();
   const nextCard = db.prepare(`
     SELECT * FROM cards
     WHERE status = 'Planned'
@@ -132,7 +143,7 @@ export async function dispatchNextTask(db: DatabaseSync): Promise<{ dispatched: 
         project_path IS NULL
         OR project_path NOT IN (
           SELECT project_path FROM cards
-          WHERE status IN ${ACTIVE_STATUSES} AND project_path IS NOT NULL
+          WHERE status IN ${ACTIVE_STATUSES} AND project_path IS NOT NULL AND ${ACTIVE_OWNED_CLAUSE}
         )
       )
       AND (
@@ -142,7 +153,7 @@ export async function dispatchNextTask(db: DatabaseSync): Promise<{ dispatched: 
       )
     ORDER BY priority DESC, updated_at ASC
     LIMIT 1
-  `).get(now) as any;
+  `).get(now, now) as any;
 
   if (!nextCard) {
     return { dispatched: false, reason: "No pending cards in Planned" };
@@ -185,7 +196,7 @@ export function startQueueWorker(db: DatabaseSync, onTick?: () => void | Promise
       const config = getQueueConfig(db);
       if (!config.autoDispatch) return;
 
-      const activeRows = db.prepare(`SELECT count(*) as c FROM cards WHERE status IN ${ACTIVE_STATUSES}`).get() as { c: number };
+      const activeRows = db.prepare(`SELECT count(*) as c FROM cards WHERE status IN ${ACTIVE_STATUSES} AND ${ACTIVE_OWNED_CLAUSE}`).get(Date.now()) as { c: number };
       if ((activeRows?.c ?? 0) < config.maxConcurrentTasks) {
         await dispatchNextTask(db);
       }
