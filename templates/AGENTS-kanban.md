@@ -162,8 +162,12 @@ If the source message does not contain a project path, do NOT include `project_p
 ## API Reference
 
 ```bash
-# List Inbox cards
+# List cards (filter by status or project_path)
 curl -H "Authorization: Bearer $KANBAN_TOKEN" http://127.0.0.1:8788/api/cards?status=Inbox
+curl -H "Authorization: Bearer $KANBAN_TOKEN" "http://127.0.0.1:8788/api/cards?project_path=/Users/me/my-project"
+
+# Get a single card by ID
+curl -H "Authorization: Bearer $KANBAN_TOKEN" http://127.0.0.1:8788/api/cards/<id>
 
 # Create a card with project_path
 curl -H "Authorization: Bearer $KANBAN_TOKEN" -X POST http://127.0.0.1:8788/api/cards \
@@ -183,7 +187,36 @@ curl -H "Authorization: Bearer $KANBAN_TOKEN" -X POST http://127.0.0.1:8788/api/
 
 # Stop a running agent
 curl -H "Authorization: Bearer $KANBAN_TOKEN" -X POST http://127.0.0.1:8788/api/cards/<id>/stop
+
+# --- Session Control (for external agents) ---
+
+# Claim a card for exclusive work (card must be Inbox or Planned)
+# Sets card to "In Progress", lease expires in 15 minutes
+curl -H "Authorization: Bearer $KANBAN_TOKEN" -X POST \
+  http://127.0.0.1:8788/api/cards/<id>/claim \
+  -H 'content-type: application/json' \
+  -d '{"session_id":"your-session-id"}'
+
+# Heartbeat: extend lease by 15 minutes (call every 10 minutes to keep claim)
+curl -H "Authorization: Bearer $KANBAN_TOKEN" -X POST \
+  http://127.0.0.1:8788/api/cards/<id>/heartbeat \
+  -H 'content-type: application/json' \
+  -d '{"session_id":"your-session-id"}'
+
+# Release claim: outcome can be "done" (→ Review/Test), "blocked" (→ Stopped), or "abandon" (→ Planned)
+curl -H "Authorization: Bearer $KANBAN_TOKEN" -X POST \
+  http://127.0.0.1:8788/api/cards/<id>/release \
+  -H 'content-type: application/json' \
+  -d '{"session_id":"your-session-id","outcome":"done"}'
 ```
+
+**Session Control Notes:**
+
+- **Claim** reserves a card for exclusive work. Returns `409` if card is not `Inbox`/`Planned`, or already claimed by another session.
+- **Heartbeat** keeps the claim alive. Must be called every 10-14 minutes to prevent lease expiration (15min window).
+- **Release** moves the card based on outcome and clears the claim. Returns `409` if `session_id` doesn't match the claim.
+- **Reclaim** with same `session_id` is idempotent and just refreshes the lease.
+- Find relevant cards with `?project_path=/your/cwd` to avoid claiming unrelated work.
 
 ## Git Safety Rule
 

@@ -46,13 +46,24 @@
 > **This section is written for AI coding agents.**
 > If you are an AI assistant and the user has asked you to install Claw-Kanban, follow the steps below exactly. Each step includes a verification command — run it and confirm success before proceeding to the next step.
 
+### ⚠️ CRITICAL: Node.js ≥22 Required
+
+**Claw-Kanban REQUIRES Node.js version 22 or higher.** It uses `node:sqlite`, a built-in module only available in Node.js 22+.
+
+- **Node.js 20 and earlier WILL FAIL** with `Cannot find module 'node:sqlite'` errors.
+- **Check your version FIRST:** `node -v` must show `v22.x.x` or higher.
+- **Upgrade if needed:** 
+  - Official installer: https://nodejs.org/ (download the Current/LTS 22+ release)
+  - With nvm: `nvm install 22 && nvm use 22`
+  - With Homebrew (macOS): `brew install node@22 && brew link node@22`
+
 ### Step 0: Check Prerequisites
 
 ```bash
-# 1. Check Node.js version (must be 22 or higher)
+# 1. Check Node.js version (MUST BE 22 OR HIGHER)
 node -v
-# Expected: v22.x.x or higher. If missing or below v22, stop and tell the user:
-#   "Node.js 22+ is required. Install from https://nodejs.org/ or use nvm: nvm install 22"
+# Expected: v22.x.x or higher. If you see v20.x.x or lower, STOP and upgrade Node.js first.
+# The installation will fail without Node.js 22+.
 
 # 2. Check for pnpm (recommended) or npm
 pnpm -v || npm -v
@@ -224,7 +235,16 @@ HTTP agents call provider APIs directly from the server. No CLI installation req
 
 ## Prerequisites
 
-- **Node.js 22+** (required for `node:sqlite`)
+### ⚠️ Node.js ≥22 is MANDATORY
+
+**Claw-Kanban will NOT work with Node.js 20 or earlier.** The server uses `node:sqlite`, which is only available in Node.js 22+.
+
+- **Verify your version:** `node -v` must show `v22.x.x` or higher
+- **Node.js 20 fails with:** `Error: Cannot find module 'node:sqlite'`
+- **Upgrade:** https://nodejs.org/ or `nvm install 22 && nvm use 22`
+
+### Other Requirements
+
 - **pnpm** (recommended) or npm
 - At least one AI agent available:
 
@@ -246,6 +266,8 @@ HTTP agents call provider APIs directly from the server. No CLI installation req
 
 ## Quick Start
 
+> **Before you begin:** Ensure you have **Node.js 22 or higher** installed. Run `node -v` to check. Node.js 20 and earlier will fail. See [Prerequisites](#prerequisites) for upgrade instructions.
+
 ### One-Line Install
 
 **macOS / Linux:**
@@ -265,6 +287,9 @@ The installer clones the repo, installs dependencies, builds the UI, configures 
 ### Manual Install
 
 ```bash
+# FIRST: Verify Node.js 22+
+node -v  # Must show v22.x.x or higher
+
 git clone https://github.com/GreenSheep01201/Claw-Kanban.git
 cd Claw-Kanban
 pnpm install
@@ -497,7 +522,8 @@ Claw-Kanban/
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| `GET` | `/api/cards` | List all cards (optional `?status=Inbox`) |
+| `GET` | `/api/cards` | List all cards (optional `?status=Inbox&project_path=/path`) |
+| `GET` | `/api/cards/:id` | Get a single card by ID |
 | `GET` | `/api/cards/search?q=keyword` | Search cards across all fields |
 | `POST` | `/api/cards` | Create a card |
 | `PATCH` | `/api/cards/:id` | Update card fields |
@@ -513,6 +539,52 @@ Claw-Kanban/
 | `POST` | `/api/cards/:id/review` | Manually trigger review |
 | `GET` | `/api/cards/:id/terminal` | Stream terminal output (`?lines=200&pretty=1`) |
 | `GET` | `/api/cards/:id/logs` | Get card event logs |
+
+### Session Control
+
+External sessions (e.g. a Claude Code session working on the same project) can claim, hold, and release cards to coordinate with the board and prevent concurrent work on the same task.
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `POST` | `/api/cards/:id/claim` | Claim a card for exclusive work. Card must be `Inbox` or `Planned`. Request body: `{"session_id": "your-session-id"}`. Sets card to `In Progress`, lease expires in 15 minutes. Returns `409` if card is not claimable or already claimed by another session. |
+| `POST` | `/api/cards/:id/heartbeat` | Extend lease by 15 minutes. Request body: `{"session_id": "your-session-id"}`. Returns `409` if session doesn't match the claim. |
+| `POST` | `/api/cards/:id/release` | Release claim and move card. Request body: `{"session_id": "your-session-id", "outcome": "done\|blocked\|abandon"}`. Outcomes: `done` → `Review/Test`, `blocked` → `Stopped`, `abandon` → back to `Planned`. Returns `409` if session doesn't match. |
+
+**Claim semantics:**
+
+- **Lease duration:** 15 minutes, renewed by heartbeat
+- **409 conflict cases:**
+  - Claiming a card that's not `Inbox` or `Planned`
+  - Claiming a card already claimed by another session
+  - Heartbeat/release with wrong `session_id`
+- **Session filter:** Use `GET /api/cards?project_path=/your/project` to find cards relevant to your working directory
+- **Idempotent reclaim:** Re-claiming with the same `session_id` is allowed and just refreshes the lease
+
+**Example workflow:**
+
+```bash
+# Find cards for your project
+curl -H "Authorization: Bearer $KANBAN_TOKEN" \
+  "http://127.0.0.1:8788/api/cards?project_path=/Users/me/my-project"
+
+# Claim a card
+curl -H "Authorization: Bearer $KANBAN_TOKEN" -X POST \
+  http://127.0.0.1:8788/api/cards/ABC-123/claim \
+  -H 'content-type: application/json' \
+  -d '{"session_id":"sess_abc123"}'
+
+# Heartbeat every 10 minutes to keep the claim
+curl -H "Authorization: Bearer $KANBAN_TOKEN" -X POST \
+  http://127.0.0.1:8788/api/cards/ABC-123/heartbeat \
+  -H 'content-type: application/json' \
+  -d '{"session_id":"sess_abc123"}'
+
+# Release when done
+curl -H "Authorization: Bearer $KANBAN_TOKEN" -X POST \
+  http://127.0.0.1:8788/api/cards/ABC-123/release \
+  -H 'content-type: application/json' \
+  -d '{"session_id":"sess_abc123","outcome":"done"}'
+```
 
 ### Settings & Status
 
