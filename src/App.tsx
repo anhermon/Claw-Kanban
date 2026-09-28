@@ -909,6 +909,9 @@ export default function App() {
               </span>
             </div>
             <div className="colBody">
+              {columns[s].length === 0 && (selectedSessionId || sourceFilter) && (
+                <div className="colEmpty">No cards match the filter</div>
+              )}
               {columns[s].map((c) => (
                 <div key={c.id} className={"card"
                        + (selected?.id === c.id ? " selected" : "")
@@ -924,6 +927,7 @@ export default function App() {
                     {c.status === "In Progress" && <span className="agentActiveDot" aria-hidden="true"></span>}
                     {c.status === "Review/Test" && <span className="agentReviewDot" aria-hidden="true"></span>}
                     <span className="cardModel">{c.assignee ?? "unassigned"}</span>
+                    {c.claimed_session_id && <span className="cardClaimed" title={`Claimed by session ${c.claimed_session_id.slice(0, 8)}`}>🔒 claimed</span>}
                     {c.role && <span className="cardRole">{ROLES.find(r => r.value === c.role)?.label}</span>}
                     {(() => {
                       const duration = cardDurationSummary(c);
@@ -1050,6 +1054,11 @@ export default function App() {
                     </option>
                   ))}
                 </select>
+                {selected.assignee && !isProviderAvailable(selected.assignee) && (
+                  <div className="providerWarning">
+                    ⚠ Provider "{selected.assignee}" is not authenticated. Start will fail unless you authenticate it in Settings or change the provider.
+                  </div>
+                )}
               </div>
             </div>
 
@@ -1108,12 +1117,18 @@ export default function App() {
                 {(selected.status === "Inbox" || selected.status === "Planned" || selected.status === "Stopped") && (
                   <button
                     className="btn primary"
+                    disabled={selected.assignee ? !isProviderAvailable(selected.assignee) : false}
                     onClick={async () => {
+                      if (selected.assignee && !isProviderAvailable(selected.assignee)) {
+                        alert(`Cannot start: Provider "${selected.assignee}" is not authenticated. Please authenticate it in Settings or change the provider.`);
+                        return;
+                      }
                       if (!confirm("Start this task (run agent)?")) return;
                       await runCard(selected.id);
                       await refresh();
                       setTermOpen(true);
                     }}
+                    title={selected.assignee && !isProviderAvailable(selected.assignee) ? `Provider "${selected.assignee}" is not authenticated` : undefined}
                   >{selected.status === "Stopped" ? "Restart" : "Start"}</button>
                 )}
 
