@@ -471,13 +471,14 @@ export default function App() {
     }
   }
 
-  // Provider is available if authenticated (CLI) or connected (OAuth)
+  // Provider is available if authenticated (CLI) or connected (OAuth).
+  // Default to false (unavailable) while status is loading - safer than assuming available.
   const isProviderAvailable = (p: Provider) => {
     const oauthEntry = OAUTH_ASSIGNABLE.find((o) => o.value === p);
     if (oauthEntry) {
       return oauthStatus?.[oauthEntry.oauthKey]?.connected ?? false;
     }
-    return cliStatus?.[p]?.authenticated ?? true;
+    return cliStatus?.[p]?.authenticated ?? false;
   };
 
   async function handleSaveSettings() {
@@ -496,6 +497,8 @@ export default function App() {
   useEffect(() => {
     refresh().catch((e) => setErr(String(e)));
     loadSettings().catch(() => {});
+    loadCliStatus().catch(() => {});
+    loadOAuthStatus().catch(() => {});
     const t = setInterval(() => refresh().catch(() => {}), 1200);
     return () => clearInterval(t);
     // eslint-disable-next-line react-hooks/exhaustive-deps
