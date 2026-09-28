@@ -2637,6 +2637,19 @@ app.get("/api/cards/search", (req, res) => {
   res.json({ cards: rows });
 });
 
+app.get("/api/cards/:id", (req, res) => {
+  const id = String(req.params.id);
+  const row = db.prepare(`${CARDS_WITH_RUN_START_SQL} WHERE c.id = ?`).get(id);
+  
+  if (!row) {
+    return res.status(404).json({ error: "not_found" });
+  }
+
+  const cardsWithStats = attachRunStats([row] as CardRow[]);
+  const cardsWithOverlay = attachSessionOverlay(cardsWithStats);
+  res.json({ card: cardsWithOverlay[0] });
+});
+
 app.post("/api/cards", (req, res) => {
   const input = createCardSchema.parse(req.body ?? {});
   const t = nowMs();
