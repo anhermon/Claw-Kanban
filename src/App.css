@@ -346,6 +346,14 @@ body {
   overflow-y: auto;
   min-height: 0;
 }
+.colEmpty {
+  padding: 12px 10px;
+  font-size: 11px;
+  color: var(--text-3);
+  text-align: center;
+  line-height: 1.5;
+  font-style: italic;
+}
 
 /* ===================================================================
    CARDS
@@ -463,6 +471,16 @@ body {
   background: rgba(255, 255, 255, 0.03);
   border: 1px solid var(--line);
 }
+.cardClaimed {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 5px;
+  font-size: 9px;
+  font-weight: 600;
+  color: var(--warn);
+  background: var(--warn-wash);
+  border: 1px solid var(--warn);
+}
 .cardDuration {
   display: inline-flex;
   align-items: center;
@@ -571,7 +589,7 @@ body {
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: minmax(190px, 1.1fr) minmax(170px, 0.95fr) minmax(210px, 1.25fr) minmax(140px, 0.85fr) minmax(220px, 1.3fr);
+  grid-template-columns: minmax(190px, 1.1fr) minmax(170px, 0.95fr) minmax(210px, 1.25fr) minmax(140px, 0.85fr) minmax(280px, 1.6fr);
   gap: 18px;
   padding: 12px 18px 16px;
   overflow: hidden;
@@ -610,6 +628,16 @@ body {
 }
 .drawerFieldGroup input { cursor: text; background-image: none; padding-right: 9px; font-family: 'JetBrains Mono', monospace; font-size: 10.5px; }
 .drawerFieldGroup select:focus, .drawerFieldGroup input:focus { border-color: var(--accent); }
+
+.providerWarning {
+  padding: 7px 9px;
+  font-size: 10.5px;
+  line-height: 1.4;
+  color: var(--warn);
+  background: var(--warn-wash);
+  border: 1px solid var(--warn);
+  margin-top: 4px;
+}
 
 .drawerTextarea {
   flex: 1;
