@@ -508,4 +508,63 @@ export async function getRecentSessions(): Promise<RecentSession[]> {
   return j.sessions as RecentSession[];
 }
 
+// --- Session control (claim/heartbeat/release) ---
+
+export interface ClaimResponse {
+  ok: boolean;
+  card?: Card;
+}
+
+export async function claimCard(id: string, sessionId: string): Promise<ClaimResponse> {
+  const r = await fetch(`${base}/api/cards/${id}/claim`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ session_id: sessionId }),
+  });
+  if (!r.ok) {
+    const body = await r.json().catch(() => null);
+    throw new Error(body?.error ?? `claimCard failed: ${r.status}`);
+  }
+  return (await r.json()) as ClaimResponse;
+}
+
+export interface HeartbeatResponse {
+  ok: boolean;
+  claim_expires_at: number;
+}
+
+export async function heartbeatCard(id: string, sessionId: string): Promise<HeartbeatResponse> {
+  const r = await fetch(`${base}/api/cards/${id}/heartbeat`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ session_id: sessionId }),
+  });
+  if (!r.ok) {
+    const body = await r.json().catch(() => null);
+    throw new Error(body?.error ?? `heartbeatCard failed: ${r.status}`);
+  }
+  return (await r.json()) as HeartbeatResponse;
+}
+
+export interface ReleaseResponse {
+  ok: boolean;
+  card?: Card;
+}
+
+export async function releaseCard(
+  id: string,
+  sessionId: string,
+  outcome: "done" | "blocked" | "abandon"
+): Promise<ReleaseResponse> {
+  const r = await fetch(`${base}/api/cards/${id}/release`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ session_id: sessionId, outcome }),
+  });
+  if (!r.ok) {
+    const body = await r.json().catch(() => null);
+    throw new Error(body?.error ?? `releaseCard failed: ${r.status}`);
+  }
+  return (await r.json()) as ReleaseResponse;
+}
 

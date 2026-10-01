@@ -50,6 +50,9 @@ import {
   moveActiveToBacklog,
   dispatchNextTask,
   getRecentSessions,
+  claimCard,
+  heartbeatCard,
+  releaseCard,
   type QueueStatusResponse,
 } from "./api";
 
@@ -85,6 +88,20 @@ const OAUTH_PROVIDERS: { value: OAuthConnectProvider; label: string; desc: strin
 // re-pick it after every refresh while isolating the cards from one harness sync/source among
 // the ~180 synced cards.
 const SOURCE_FILTER_STORAGE_KEY = "clawKanban.sourceFilter";
+const HUMAN_SESSION_ID_STORAGE_KEY = "clawKanban.humanSessionId";
+
+// Generate a persistent session ID for the human board user (for claim/heartbeat/release)
+function getOrCreateHumanSessionId(): string {
+  try {
+    const existing = localStorage.getItem(HUMAN_SESSION_ID_STORAGE_KEY);
+    if (existing) return existing;
+    const newId = `human-board-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+    localStorage.setItem(HUMAN_SESSION_ID_STORAGE_KEY, newId);
+    return newId;
+  } catch {
+    return `human-board-${Date.now()}-${Math.random().toString(36).slice(2, 11)}`;
+  }
+}
 
 function fmtTime(ms: number) {
   const d = new Date(ms);
@@ -303,6 +320,9 @@ export default function App() {
   const [newRole, setNewRole] = useState<Role | "">("");
   const [newTaskType, setNewTaskType] = useState<TaskType | "">("");
   const [newProjectPath, setNewProjectPath] = useState("");
+
+  // Human board user's session ID for claim/heartbeat/release operations
+  const [humanSessionId] = useState<string>(() => getOrCreateHumanSessionId());
 
   async function refresh() {
     const cs = await listCards();
@@ -665,6 +685,36 @@ export default function App() {
   async function openCard(card: Card) {
     setSelected(card);
     setLogs(await getLogs(card.id));
+  }
+
+  async function handleClaim(cardId: string) {
+    try {
+      await claimCard(cardId, humanSessionId);
+      await refresh();
+    } catch (e) {
+      const eObj = e as { message?: string };
+      setErr(eObj?.message ?? String(e));
+    }
+  }
+
+  async function handleHeartbeat(cardId: string) {
+    try {
+      await heartbeatCard(cardId, humanSessionId);
+      await refresh();
+    } catch (e) {
+      const eObj = e as { message?: string };
+      setErr(eObj?.message ?? String(e));
+    }
+  }
+
+  async function handleRelease(cardId: string, outcome: "done" | "blocked" | "abandon") {
+    try {
+      await releaseCard(cardId, humanSessionId, outcome);
+      await refresh();
+    } catch (e) {
+      const eObj = e as { message?: string };
+      setErr(eObj?.message ?? String(e));
+    }
   }
 
   return (
@@ -1116,6 +1166,73 @@ export default function App() {
                     setSessionOpen(true);
                   }}
                 >🔎 Agent Session</button>
+
+                {/* Session control buttons (Claim/Heartbeat/Release) */}
+                {(() => {
+                  const isClaimedByMe = selected.claimed_session_id === humanSessionId;
+                  const isClaimedByOther = selected.claimed_session_id && !isClaimedByMe;
+                  const isClaimable = (selected.status === "Inbox" || selected.status === "Planned") && !isClaimedByOther;
+
+                  return (
+                    <>
+                      {isClaimable && (
+                        <button
+                          className="btn"
+                          onClick={async () => {
+                            if (!confirm(`Claim this card for exclusive work?\n\nThis will move it to "In Progress" and prevent others from claiming it for 15 minutes.`)) return;
+                            await handleClaim(selected.id);
+                          }}
+                          title="Claim this card for exclusive work (15-minute lease)"
+                        >🔒 Claim</button>
+                      )}
+
+                      {isClaimedByMe && (
+                        <>
+                          <button
+                            className="btn"
+                            onClick={async () => {
+                              await handleHeartbeat(selected.id);
+                            }}
+                            title="Extend your claim by another 15 minutes"
+                          >💓 Heartbeat</button>
+
+                          <button
+                            className="btn"
+                            onClick={async () => {
+                              if (!confirm('Release claim and mark as "Done" (move to Review/Test)?')) return;
+                              await handleRelease(selected.id, "done");
+                            }}
+                            title="Release claim and move to Review/Test"
+                          >✅ Release (Done)</button>
+
+                          <button
+                            className="btn"
+                            onClick={async () => {
+                              if (!confirm('Release claim and mark as "Blocked" (move to Stopped)?')) return;
+                              await handleRelease(selected.id, "blocked");
+                            }}
+                            title="Release claim and move to Stopped"
+                          >🚫 Release (Blocked)</button>
+
+                          <button
+                            className="btn"
+                            onClick={async () => {
+                              if (!confirm('Release claim and "Abandon" (move back to Planned)?')) return;
+                              await handleRelease(selected.id, "abandon");
+                            }}
+                            title="Release claim and move back to Planned"
+                          >↩️ Release (Abandon)</button>
+                        </>
+                      )}
+
+                      {isClaimedByOther && (
+                        <div className="sessionControlInfo" style={{ padding: "8px", background: "rgba(255,255,255,0.05)", borderRadius: "4px", fontSize: "0.9em" }}>
+                          🔒 Card is claimed by session: <code>{selected.claimed_session_id?.slice(0, 12)}...</code>
+                        </div>
+                      )}
+                    </>
+                  );
+                })()}
 
                 {(selected.status === "Inbox" || selected.status === "Planned" || selected.status === "Stopped") && (
                   <button
